@@ -62,6 +62,10 @@ elem.getprevious()                 # previous sibling or None
 elem.xpath(".//title")             # context-node evaluation
 elem.xpath_text("author")         # text extraction from context
 
+# Batch APIs (single FFI call, interned strings)
+root.child_tags()                  # -> list[str] of child tag names
+root.descendant_tags("item")       # -> list[str] filtered by tag
+
 # Compiled XPath (like re.compile)
 expr = simdxml.compile("//title")
 expr.eval_text(doc)                # -> list[str]
@@ -118,33 +122,71 @@ Full conformance with XPath 1.0:
 
 ## Benchmarks
 
-Measured on Apple Silicon (M-series), Python 3.14, comparing against
-lxml 6.0 and stdlib `xml.etree.ElementTree`. Run with `uv run python bench/bench_parse.py`.
+Apple Silicon, Python 3.14, lxml 6.0. GC disabled during timing, 3 warmup +
+20 timed iterations, median reported. Three corpus types: data-oriented
+(product catalog), document-oriented (PubMed abstracts), config-oriented
+(Maven POM). Run yourself: `uv run python bench/bench_parse.py`
 
-### Parse throughput
+### Parse
 
-| Document | simdxml | lxml | stdlib ET | vs lxml | vs stdlib |
-|----------|---------|------|-----------|---------|-----------|
-| 20 KB (100 items) | 0.05 ms | 0.09 ms | 0.15 ms | 1.8x | 3.0x |
-| 2 MB (10K items) | 3.3 ms | 8.5 ms | 16.7 ms | 2.6x | 5.0x |
-| 20 MB (100K items) | 40 ms | 87 ms | 181 ms | **2.2x** | **4.5x** |
+`simdxml.parse()` eagerly builds structural indices (CSR, name posting,
+parent map). lxml's `fromstring()` builds a DOM tree without precomputed
+query indices. simdxml front-loads more work into parse so queries are faster
+-- both numbers are real, the trade-off depends on your workload.
 
-### XPath query: `//name`
+| Corpus | Size | simdxml | lxml | vs lxml | vs stdlib |
+|--------|------|---------|------|---------|-----------|
+| Catalog (data) | 1.6 MB | 4.8 ms | 8.5 ms | 1.8x | 3.1x |
+| Catalog (data) | 17 MB | 57 ms | 86 ms | 1.5x | 2.7x |
+| PubMed (doc) | 1.7 MB | 4.1 ms | 6.3 ms | 1.5x | 3.3x |
+| PubMed (doc) | 17 MB | 46 ms | 64 ms | 1.4x | 3.1x |
+| POM (config) | 2.1 MB | 4.8 ms | 8.6 ms | 1.8x | 3.8x |
 
-| Document | simdxml | lxml | stdlib findall | vs lxml | vs stdlib |
-|----------|---------|------|----------------|---------|-----------|
-| 2 MB | 0.3 ms | 1.0 ms | 0.7 ms | 3.1x | 2.1x |
-| 20 MB | 3.8 ms | 19.7 ms | 7.3 ms | **5.2x** | **1.9x** |
+### XPath queries (returning Elements -- apples-to-apples)
 
-### XPath query with predicate: `//item[@category="cat5"]`
+| Query | Corpus | simdxml | lxml | vs lxml |
+|-------|--------|---------|------|---------|
+| `//item` | Catalog 17 MB | 4.0 ms | 22.5 ms | **5.6x** |
+| `//item[@category="cat5"]` | Catalog 17 MB | 1.7 ms | 72 ms | **41x** |
+| `//PubmedArticle` | PubMed 17 MB | 0.41 ms | 10.4 ms | **25x** |
+| `//Author[LastName="Auth0_0"]` | PubMed 17 MB | 17.6 ms | 30.7 ms | **1.7x** |
+| `//dependency` | POM 2.1 MB | 0.41 ms | 0.72 ms | 1.8x |
+| `//dependency[scope="test"]` | POM 2.1 MB | 2.5 ms | 3.5 ms | 1.4x |
 
-| Document | simdxml | lxml | stdlib findall | vs lxml |
-|----------|---------|------|----------------|---------|
-| 2 MB | 0.2 ms | 2.8 ms | 0.8 ms | 16x |
-| 20 MB | 2.0 ms | 46 ms | 9.1 ms | **23x** |
+The predicate speedup on large documents is dramatic because the structural
+index enables direct attribute comparison without materializing DOM nodes.
 
-The predicate speedup is dramatic because simdxml's structural index enables
-direct attribute comparison without materializing DOM nodes.
+### XPath text extraction
+
+`xpath_text()` returns strings directly, avoiding Python Element object
+creation. This is the optimized path for ETL / data extraction workloads.
+
+| Query | Corpus | simdxml | lxml xpath+.text | vs lxml |
+|-------|--------|---------|------------------|---------|
+| `//name` | Catalog 17 MB | 3.1 ms | 42 ms | **14x** |
+| `//AbstractText` | PubMed 17 MB | 0.64 ms | 8.3 ms | **13x** |
+| `//artifactId` | POM 2.1 MB | 0.39 ms | 0.70 ms | 1.8x |
+
+### Element traversal
+
+simdxml provides two traversal modes:
+
+**Batch API** (`child_tags()`, `descendant_tags()`): returns all tag names
+in a single FFI call using interned Python strings. This is the fast path.
+
+**Per-element iteration** (`for e in root`): creates flyweight Element
+objects. Each `.tag` access is a refcount bump on an interned string (no
+copy), but creating Element objects has unavoidable PyO3 overhead.
+
+| Corpus | `child_tags()` | `[e.tag]` loop | lxml loop | stdlib loop | batch vs lxml |
+|--------|----------------|----------------|-----------|-------------|---------------|
+| Catalog 17 MB | **0.45 ms** | 5.4 ms | 11.3 ms | 2.1 ms | **25x** |
+| PubMed 17 MB | **0.05 ms** | 0.53 ms | 0.62 ms | 0.16 ms | **13x** |
+| POM 2.1 MB | **0.2 us** | 0.5 us | 0.7 us | 0.3 us | **3x** |
+
+Use `child_tags()` / `descendant_tags()` when you need tag names. Use
+`xpath_text()` when you need text. Reserve per-element iteration for when
+you need to navigate the tree interactively.
 
 ## How it works
 
@@ -157,7 +199,8 @@ and parents -- all indexed by the same position.
 - O(1) ancestor/descendant checks via pre/post-order numbering
 - O(1) child enumeration via CSR (Compressed Sparse Row) indices
 - SIMD-accelerated structural parsing (NEON on ARM, AVX2 on x86)
-- Lazy index building: CSR indices built on first query, not at parse time
+- Parse eagerly builds all indices (CSR, name posting, parent map) so
+  subsequent queries pay zero index construction cost
 
 ## Platform support
 
