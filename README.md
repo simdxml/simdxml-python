@@ -129,64 +129,52 @@ Apple Silicon, Python 3.14, lxml 6.0. GC disabled during timing, 3 warmup +
 
 ### Parse
 
-`simdxml.parse()` eagerly builds structural indices (CSR, name posting,
-parent map). lxml's `fromstring()` builds a DOM tree without precomputed
-query indices. simdxml front-loads more work into parse so queries are faster
--- both numbers are real, the trade-off depends on your workload.
+`simdxml.parse()` eagerly builds structural indices (CSR, name posting).
+lxml's `fromstring()` builds a DOM tree without precomputed query indices.
+simdxml front-loads more work into parse so queries are faster — both numbers
+are real, the trade-off depends on your workload.
 
 | Corpus | Size | simdxml | lxml | vs lxml | vs stdlib |
 |--------|------|---------|------|---------|-----------|
-| Catalog (data) | 1.6 MB | 4.8 ms | 8.5 ms | 1.8x | 3.1x |
-| Catalog (data) | 17 MB | 57 ms | 86 ms | 1.5x | 2.7x |
-| PubMed (doc) | 1.7 MB | 4.1 ms | 6.3 ms | 1.5x | 3.3x |
-| PubMed (doc) | 17 MB | 46 ms | 64 ms | 1.4x | 3.1x |
-| POM (config) | 2.1 MB | 4.8 ms | 8.6 ms | 1.8x | 3.8x |
+| Catalog (data) | 1.6 MB | 2.7 ms | 8.1 ms | **3.0x** | **5.4x** |
+| Catalog (data) | 17 MB | 32 ms | 82 ms | **2.6x** | **4.7x** |
+| PubMed (doc) | 1.7 MB | 2.3 ms | 6.0 ms | **2.7x** | **5.9x** |
+| PubMed (doc) | 17 MB | 27 ms | 61 ms | **2.2x** | **5.0x** |
+| POM (config) | 2.1 MB | 2.7 ms | 8.3 ms | **3.1x** | **6.6x** |
 
-### XPath queries (returning Elements -- apples-to-apples)
+### XPath queries (returning Elements — apples-to-apples)
 
 | Query | Corpus | simdxml | lxml | vs lxml |
 |-------|--------|---------|------|---------|
-| `//item` | Catalog 17 MB | 4.0 ms | 22.5 ms | **5.6x** |
-| `//item[@category="cat5"]` | Catalog 17 MB | 1.7 ms | 72 ms | **41x** |
-| `//PubmedArticle` | PubMed 17 MB | 0.41 ms | 10.4 ms | **25x** |
-| `//Author[LastName="Auth0_0"]` | PubMed 17 MB | 17.6 ms | 30.7 ms | **1.7x** |
-| `//dependency` | POM 2.1 MB | 0.41 ms | 0.72 ms | 1.8x |
-| `//dependency[scope="test"]` | POM 2.1 MB | 2.5 ms | 3.5 ms | 1.4x |
-
-The predicate speedup on large documents is dramatic because the structural
-index enables direct attribute comparison without materializing DOM nodes.
+| `//item` | Catalog 17 MB | 3.4 ms | 21 ms | **6x** |
+| `//item[@category="cat5"]` | Catalog 17 MB | 1.6 ms | 69 ms | **42x** |
+| `//PubmedArticle` | PubMed 17 MB | 0.35 ms | 9.8 ms | **28x** |
+| `//Author[LastName="Auth0_0"]` | PubMed 17 MB | 13 ms | 29 ms | **2.2x** |
+| `//dependency` | POM 2.1 MB | 0.34 ms | 1.1 ms | **3.3x** |
+| `//dependency[scope="test"]` | POM 2.1 MB | 2.4 ms | 3.6 ms | **1.5x** |
 
 ### XPath text extraction
 
-`xpath_text()` returns strings directly, avoiding Python Element object
-creation. This is the optimized path for ETL / data extraction workloads.
+`xpath_text()` returns strings directly, avoiding Element object creation.
+This is the optimized path for ETL / data extraction workloads.
 
 | Query | Corpus | simdxml | lxml xpath+.text | vs lxml |
 |-------|--------|---------|------------------|---------|
-| `//name` | Catalog 17 MB | 3.1 ms | 42 ms | **14x** |
-| `//AbstractText` | PubMed 17 MB | 0.64 ms | 8.3 ms | **13x** |
-| `//artifactId` | POM 2.1 MB | 0.39 ms | 0.70 ms | 1.8x |
+| `//name` | Catalog 17 MB | 1.8 ms | 37 ms | **20x** |
+| `//AbstractText` | PubMed 17 MB | 0.31 ms | 7.1 ms | **23x** |
+| `//artifactId` | POM 2.1 MB | 0.21 ms | 2.0 ms | **10x** |
 
 ### Element traversal
 
-simdxml provides two traversal modes:
+`child_tags()` and `descendant_tags()` return all tag names in a single
+call using interned Python strings. Per-element iteration (`for e in root`)
+is also available but creates Element objects with some overhead.
 
-**Batch API** (`child_tags()`, `descendant_tags()`): returns all tag names
-in a single FFI call using interned Python strings. This is the fast path.
-
-**Per-element iteration** (`for e in root`): creates flyweight Element
-objects. Each `.tag` access is a refcount bump on an interned string (no
-copy), but creating Element objects has unavoidable PyO3 overhead.
-
-| Corpus | `child_tags()` | `[e.tag]` loop | lxml loop | stdlib loop | batch vs lxml |
-|--------|----------------|----------------|-----------|-------------|---------------|
-| Catalog 17 MB | **0.45 ms** | 5.4 ms | 11.3 ms | 2.1 ms | **25x** |
-| PubMed 17 MB | **0.05 ms** | 0.53 ms | 0.62 ms | 0.16 ms | **13x** |
-| POM 2.1 MB | **0.2 us** | 0.5 us | 0.7 us | 0.3 us | **3x** |
-
-Use `child_tags()` / `descendant_tags()` when you need tag names. Use
-`xpath_text()` when you need text. Reserve per-element iteration for when
-you need to navigate the tree interactively.
+| Corpus | `child_tags()` | lxml `[e.tag]` | vs lxml |
+|--------|----------------|-----------------|---------|
+| Catalog 17 MB | **0.38 ms** | 6.4 ms | **17x** |
+| PubMed 17 MB | **0.03 ms** | 0.60 ms | **17x** |
+| POM 2.1 MB | **0.2 us** | 0.5 us | **3x** |
 
 ## How it works
 
