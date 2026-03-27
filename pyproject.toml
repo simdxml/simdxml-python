@@ -1,0 +1,64 @@
+[project]
+name = "simdxml"
+version = "0.1.0"
+description = "SIMD-accelerated XML parser with full XPath 1.0 support"
+readme = "README.md"
+authors = [
+    { name = "Christopher Grainger", email = "chris@amplified.ai" },
+]
+requires-python = ">=3.9"
+license = "MIT OR Apache-2.0"
+keywords = ["xml", "xpath", "simd", "parser", "performance"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Text Processing :: Markup :: XML",
+]
+dependencies = []
+
+[dependency-groups]
+dev = ["maturin>=1.9"]
+test = ["pytest>=8", "pytest-cov", "hypothesis", "lxml"]
+lint = ["ruff>=0.11", "pyright>=1.1"]
+
+[tool.maturin]
+module-name = "simdxml._core"
+python-packages = ["simdxml"]
+python-source = "python"
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "src/**/*.rs" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "RUF", "B", "SIM", "PTH"]
+ignore = ["N999"]  # ElementTree.py is a stdlib-compat module name
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["N817", "PTH123"]  # ET alias, open() in test helpers
+
+[tool.ruff.lint.isort]
+known-first-party = ["simdxml"]
+
+[tool.pyright]
+pythonVersion = "3.9"
+typeCheckingMode = "standard"
+include = ["python", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
