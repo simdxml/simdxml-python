@@ -1,5 +1,10 @@
 # simdxml
 
+[![PyPI](https://img.shields.io/pypi/v/simdxml)](https://pypi.org/project/simdxml/)
+[![CI](https://github.com/simdxml/simdxml-python/actions/workflows/ci.yml/badge.svg)](https://github.com/simdxml/simdxml-python/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/pypi/pyversions/simdxml)](https://pypi.org/project/simdxml/)
+[![License](https://img.shields.io/pypi/l/simdxml)](https://github.com/simdxml/simdxml-python/blob/main/LICENSE)
+
 SIMD-accelerated XML parser with full XPath 1.0 support for Python.
 
 `simdxml` parses XML into flat arrays instead of a DOM tree, then evaluates
