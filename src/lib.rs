@@ -15,6 +15,8 @@ struct IndexWithMeta<'a> {
     parents: Vec<u32>,
     /// name_id[i] = index into interned names for tag i. usize::MAX = none.
     name_ids: Vec<usize>,
+    /// Unique tag name strings (one per unique name, used to build Python interned strings).
+    unique_names: Vec<String>,
 }
 
 self_cell!(
@@ -25,12 +27,13 @@ self_cell!(
     }
 );
 
-/// A parsed XML document backed by a SIMD-accelerated structural index.
+/// A parsed XML document.
+///
+/// Created by :func:`parse`. Use :attr:`root` to get the root element,
+/// or query directly with :meth:`xpath_text` and :meth:`xpath`.
 #[pyclass]
 struct Document {
     inner: DocumentInner,
-    /// Interned tag names: unique tag name -> Python str (created once at parse).
-    /// Avoids per-access string copies across FFI.
     interned_names: Vec<Py<PyString>>,
 }
 
@@ -91,6 +94,8 @@ impl Document {
 #[pymethods]
 impl Document {
     /// Evaluate an XPath expression and return text content of matches.
+    ///
+    /// Returns the direct child text of each matching element.
     fn xpath_text(&self, expr: &str) -> PyResult<Vec<String>> {
         let index = self.index();
         let results = index
@@ -99,7 +104,9 @@ impl Document {
         Ok(results.into_iter().map(|s| s.to_string()).collect())
     }
 
-    /// Evaluate an XPath expression and return the XPath string-value of matches.
+    /// Evaluate an XPath expression and return string-values of matches.
+    ///
+    /// Returns all descendant text for each match (XPath string() semantics).
     fn xpath_string(&self, expr: &str) -> PyResult<Vec<String>> {
         let index = self.index();
         index
@@ -107,8 +114,9 @@ impl Document {
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
-    /// Evaluate an XPath expression. Returns Element list for node-sets,
-    /// strings for text/attribute nodes.
+    /// Evaluate an XPath expression.
+    ///
+    /// Returns Element objects for element nodes, strings for text/attribute nodes.
     fn xpath(slf: &Bound<'_, Self>, expr: &str) -> PyResult<Py<pyo3::types::PyList>> {
         let py = slf.py();
         let doc_py: Py<Document> = slf.clone().unbind();
@@ -140,7 +148,7 @@ impl Document {
         Ok(result.unbind())
     }
 
-    /// The root element of the document.
+    /// The root element of the document, or None if empty.
     #[getter]
     fn root(slf: &Bound<'_, Self>) -> Option<Element> {
         let py = slf.py();
@@ -158,7 +166,7 @@ impl Document {
         None
     }
 
-    /// Number of tags in the structural index.
+    /// Total number of XML tags in the document.
     #[getter]
     fn tag_count(&self) -> usize {
         self.index().tag_count()
@@ -175,18 +183,18 @@ impl Document {
 }
 
 // ---------------------------------------------------------------------------
-// Element — lightweight flyweight handle into a Document
+// Element
 // ---------------------------------------------------------------------------
 
-/// A read-only element in a parsed XML document.
+/// A read-only XML element.
 ///
-/// Holds a Python reference to the Document (preventing GC) plus a tag index.
-/// The tag name is eagerly cached as a Python string to avoid FFI on every access.
+/// Supports the ElementTree API (.tag, .text, .attrib, .get(), len(),
+/// indexing, iteration) plus lxml extensions (.xpath(), .getparent(),
+/// .getnext(), .getprevious()).
 #[pyclass(skip_from_py_object)]
 struct Element {
     doc: Py<Document>,
     tag_idx: usize,
-    /// Cached tag name (interned Python string). Avoids FFI on .tag access.
     cached_tag: Py<PyString>,
 }
 
@@ -204,13 +212,15 @@ impl Element {
 
 #[pymethods]
 impl Element {
-    /// The tag name (interned, eagerly cached — zero FFI on access).
+    /// The element's tag name (e.g., 'book', 'title').
     #[getter]
     fn tag(&self, py: Python<'_>) -> Py<PyString> {
         self.cached_tag.clone_ref(py)
     }
 
-    /// Direct text content, or None.
+    /// Text content before the first child element, or None.
+    ///
+    /// For '<p>Hello <b>world</b></p>', p.text is 'Hello '.
     #[getter]
     fn text(&self, py: Python<'_>) -> Option<String> {
         self.with_index(py, |index, _| {
@@ -227,7 +237,9 @@ impl Element {
         })
     }
 
-    /// Text after this element's closing tag (before next sibling).
+    /// Text content after this element's closing tag, or None.
+    ///
+    /// For '<p>Hello <b>world</b> more</p>', b.tail is ' more'.
     #[getter]
     fn tail(&self, py: Python<'_>) -> Option<String> {
         self.with_index(py, |index, meta| {
@@ -252,7 +264,7 @@ impl Element {
         })
     }
 
-    /// Dictionary of attributes.
+    /// Dictionary of this element's attributes.
     #[getter]
     fn attrib(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyDict>> {
         let doc = self.doc.borrow(py);
@@ -304,11 +316,14 @@ impl Element {
     }
 
     /// Number of direct child elements.
+    ///
+    /// >>> len(element)
+    /// 3
     fn __len__(&self, py: Python<'_>) -> usize {
         self.with_index(py, |index, _| index.children(self.tag_idx).len())
     }
 
-    /// Get the i-th child element.
+    /// Get a child element by index. Supports negative indexing.
     fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Element> {
         let doc = self.doc.borrow(py);
         let children = doc.index().children(self.tag_idx);
@@ -362,9 +377,9 @@ impl Element {
         }
     }
 
-    // -- Batch APIs (single FFI crossing for N results) --
-
-    /// All child tag names as a list of strings (one FFI call, interned).
+    /// All direct child tag names as a list.
+    ///
+    /// More efficient than [e.tag for e in element] for bulk access.
     fn child_tags(&self, py: Python<'_>) -> Vec<Py<PyString>> {
         let doc = self.doc.borrow(py);
         let index = doc.index();
@@ -375,7 +390,9 @@ impl Element {
             .collect()
     }
 
-    /// All descendant tag names matching optional filter.
+    /// All descendant tag names, optionally filtered.
+    ///
+    /// More efficient than [e.tag for e in element.iter(tag)] for bulk access.
     #[pyo3(signature = (tag=None))]
     fn descendant_tags(&self, py: Python<'_>, tag: Option<&str>) -> Vec<Py<PyString>> {
         let doc = self.doc.borrow(py);
@@ -396,7 +413,7 @@ impl Element {
         result
     }
 
-    /// All text content (depth-first) as a list of strings.
+    /// All text content within this element, depth-first.
     fn itertext(&self, py: Python<'_>) -> Vec<String> {
         let doc = self.doc.borrow(py);
         let index = doc.index();
@@ -405,12 +422,14 @@ impl Element {
         texts
     }
 
-    /// Concatenation of all descendant text.
+    /// All descendant text concatenated into a single string.
     fn text_content(&self, py: Python<'_>) -> String {
         self.with_index(py, |index, _| index.all_text(self.tag_idx))
     }
 
-    /// Evaluate full XPath 1.0 from this element as context node.
+    /// Evaluate an XPath 1.0 expression with this element as context.
+    ///
+    /// Returns a list of matching Element objects.
     fn xpath(&self, py: Python<'_>, expr: &str) -> PyResult<Vec<Element>> {
         let doc = self.doc.borrow(py);
         let index = doc.index();
@@ -429,7 +448,7 @@ impl Element {
         ))
     }
 
-    /// XPath text extraction from this element as context.
+    /// Evaluate an XPath expression and return text content of matches.
     fn xpath_text(&self, py: Python<'_>, expr: &str) -> PyResult<Vec<String>> {
         let doc = self.doc.borrow(py);
         let index = doc.index();
@@ -535,24 +554,29 @@ impl Element {
         Err(readonly_error())
     }
 
+    /// Not supported. Raises TypeError (simdxml elements are read-only).
     #[pyo3(name = "set")]
     fn set_attr(&self, _key: &str, _value: &str) -> PyResult<()> {
         Err(readonly_error())
     }
 
+    /// Not supported. Raises TypeError (simdxml elements are read-only).
     fn append(&self, _element: &Element) -> PyResult<()> {
         Err(readonly_error())
     }
 
+    /// Not supported. Raises TypeError (simdxml elements are read-only).
     fn remove(&self, _element: &Element) -> PyResult<()> {
         Err(readonly_error())
     }
 
+    /// Not supported. Raises TypeError (simdxml elements are read-only).
     #[pyo3(signature = (_index, _element))]
     fn insert(&self, _index: isize, _element: &Element) -> PyResult<()> {
         Err(readonly_error())
     }
 
+    /// Not supported. Raises TypeError (simdxml elements are read-only).
     fn clear(&self) -> PyResult<()> {
         Err(readonly_error())
     }
@@ -615,7 +639,10 @@ impl ElementIterator {
 // CompiledXPath
 // ---------------------------------------------------------------------------
 
-/// A compiled XPath expression for repeated evaluation.
+/// A compiled XPath expression for repeated use.
+///
+/// Like re.compile() -- parse the expression once, evaluate many times
+/// across different documents.
 #[pyclass]
 struct CompiledXPath {
     inner: simdxml::CompiledXPath,
@@ -699,15 +726,14 @@ fn get_first_attribute(index: &XmlIndex<'_>, tag_idx: usize) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Build a parent map + name_id map from the public API.
-fn build_meta(index: &XmlIndex<'_>) -> (Vec<u32>, Vec<usize>) {
+/// Build parent map, name-id map, and unique name list from the public API.
+fn build_meta(index: &XmlIndex<'_>) -> (Vec<u32>, Vec<usize>, Vec<String>) {
     let n = index.tag_count();
 
     // Parent map
     let mut parents = vec![u32::MAX; n];
     for i in 0..n {
-        let tt = index.tag_type(i);
-        if tt == simdxml::index::TagType::Open {
+        if index.tag_type(i) == simdxml::index::TagType::Open {
             for child in index.children(i) {
                 if child < n {
                     parents[child] = i as u32;
@@ -716,9 +742,9 @@ fn build_meta(index: &XmlIndex<'_>) -> (Vec<u32>, Vec<usize>) {
         }
     }
 
-    // Name interning: map tag_name -> sequential ID
+    // Name interning: borrow tag names from the index to avoid extra clones.
     let mut unique_names: Vec<String> = Vec::new();
-    let mut name_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut name_map: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     let mut name_ids = vec![usize::MAX; n];
 
     for i in 0..n {
@@ -726,51 +752,25 @@ fn build_meta(index: &XmlIndex<'_>) -> (Vec<u32>, Vec<usize>) {
         if tt == simdxml::index::TagType::Open || tt == simdxml::index::TagType::SelfClose {
             let name = index.tag_name(i);
             if !name.is_empty() {
-                let id = match name_map.get(name) {
-                    Some(&id) => id,
-                    None => {
-                        let id = unique_names.len();
-                        unique_names.push(name.to_string());
-                        name_map.insert(name.to_string(), id);
-                        id
-                    }
-                };
+                let id = *name_map.entry(name).or_insert_with(|| {
+                    let id = unique_names.len();
+                    unique_names.push(name.to_string());
+                    id
+                });
                 name_ids[i] = id;
             }
         }
     }
 
-    (parents, name_ids)
+    (parents, name_ids, unique_names)
 }
 
-/// Build interned Python strings for all unique tag names.
-fn build_interned_names(py: Python<'_>, index: &XmlIndex<'_>, name_ids: &[usize]) -> Vec<Py<PyString>> {
-    // Find max name_id to size the vec
-    let max_id = name_ids.iter().copied().filter(|&id| id != usize::MAX).max();
-    let n_unique = match max_id {
-        Some(m) => m + 1,
-        None => return Vec::new(),
-    };
-
-    // Collect the name string for each ID
-    let mut names: Vec<Py<PyString>> = Vec::with_capacity(n_unique);
-    // Initialize with empty strings
-    let empty = PyString::new(py, "").unbind();
-    for _ in 0..n_unique {
-        names.push(empty.clone_ref(py));
-    }
-
-    for (i, &id) in name_ids.iter().enumerate() {
-        if id != usize::MAX && id < n_unique {
-            // Only set the first time we see this ID
-            let name = index.tag_name(i);
-            if !name.is_empty() {
-                names[id] = PyString::new(py, name).unbind();
-            }
-        }
-    }
-
-    names
+/// Build interned Python strings from the unique name list.
+fn build_interned_names(py: Python<'_>, unique_names: &[String]) -> Vec<Py<PyString>> {
+    unique_names
+        .iter()
+        .map(|s| PyString::new(py, s).unbind())
+        .collect()
 }
 
 /// Recursively collect text content depth-first (for itertext).
@@ -789,7 +789,10 @@ fn collect_text(index: &XmlIndex<'_>, tag_idx: usize, out: &mut Vec<String>) {
 // Module-level functions
 // ---------------------------------------------------------------------------
 
-/// Parse XML bytes or string into a Document.
+/// Parse XML into a Document.
+///
+/// Accepts bytes or str. Returns a Document that can be queried
+/// with XPath or traversed element-by-element.
 #[pyfunction]
 fn parse(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Document> {
     let bytes: Vec<u8> = if let Ok(b) = data.cast_exact::<PyBytes>() {
@@ -805,18 +808,19 @@ fn parse(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Document> {
             simdxml::parse(owner).map_err(|e| PyValueError::new_err(e.to_string()))?;
         index.ensure_indices();
         index.build_name_index();
-        let (parents, name_ids) = build_meta(&index);
+        let (parents, name_ids, unique_names) = build_meta(&index);
         Ok::<_, PyErr>(IndexWithMeta {
             index,
             parents,
             name_ids,
+            unique_names,
         })
     })?;
 
     // Build interned Python strings (one copy per unique name)
     let interned_names = {
         let meta = inner.borrow_dependent();
-        build_interned_names(py, &meta.index, &meta.name_ids)
+        build_interned_names(py, &meta.unique_names)
     };
 
     Ok(Document {
@@ -825,7 +829,10 @@ fn parse(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Document> {
     })
 }
 
-/// Compile an XPath expression for repeated evaluation.
+/// Compile an XPath expression for repeated use.
+///
+/// Like re.compile() -- parse the expression once, evaluate many times
+/// across different documents.
 #[pyfunction]
 fn compile(expr: &str) -> PyResult<CompiledXPath> {
     let inner =
