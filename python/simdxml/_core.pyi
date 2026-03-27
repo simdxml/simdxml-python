@@ -103,6 +103,33 @@ class Element:
     def xpath_text(self, expr: str) -> list[str]:
         """Evaluate an XPath expression and return text content of matches."""
         ...
+    def find(
+        self, path: str, namespaces: dict[str, str] | None = None
+    ) -> Element | None:
+        """Find first matching subelement by path (ElementTree API).
+
+        Supports: ``tag``, ``{ns}tag``, ``*/tag``, ``.//tag``, ``..``,
+        ``[@attrib]``, ``[tag]``, ``[tag='text']``.
+        """
+        ...
+    def findall(
+        self, path: str, namespaces: dict[str, str] | None = None
+    ) -> ElementList:
+        """Find all matching subelements by path (ElementTree API)."""
+        ...
+    def iterfind(
+        self, path: str, namespaces: dict[str, str] | None = None
+    ) -> Iterator[Element]:
+        """Iterate over matching subelements by path (ElementTree API)."""
+        ...
+    def findtext(
+        self,
+        path: str,
+        default: str | None = None,
+        namespaces: dict[str, str] | None = None,
+    ) -> str | None:
+        """Find text of first matching subelement (ElementTree API)."""
+        ...
     def getparent(self) -> Element | None:
         """Parent element, or None if this is the root."""
         ...
@@ -175,11 +202,13 @@ class CompiledXPath:
         """Count the number of matching nodes."""
         ...
 
-def parse(data: bytes | str) -> Document:
+def parse(data: bytes | str, *, parallel: bool = False) -> Document:
     """Parse XML into a Document.
 
     Accepts ``bytes`` or ``str``. For bytes input, the buffer is used
     directly (zero-copy). For str input, the string is encoded to UTF-8.
+
+    Set ``parallel=True`` for multi-threaded parsing of large documents (>256KB).
     """
     ...
 
@@ -188,5 +217,24 @@ def compile(expr: str) -> CompiledXPath:
 
     Like ``re.compile()`` — parse the expression once, evaluate many times
     across different documents.
+    """
+    ...
+
+def batch_xpath_text(docs: list[bytes | str], expr: CompiledXPath) -> list[list[str]]:
+    """Evaluate XPath across multiple documents with bloom prefilter.
+
+    Skips documents that can't match at ~10 GiB/s, then parses only
+    those that might. Returns one list of text results per document.
+    """
+    ...
+
+def batch_xpath_text_parallel(
+    docs: list[bytes | str],
+    expr: CompiledXPath,
+    max_threads: int | None = None,
+) -> list[list[str]]:
+    """Evaluate XPath across multiple documents in parallel.
+
+    Uses multiple threads for both parsing and evaluation.
     """
     ...

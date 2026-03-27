@@ -317,28 +317,53 @@ impl Element {
             .iter()
             .map(|&c| c as usize)
             .collect();
-        ElementIterator::new(py, &self.doc, &doc, children)
+        ElementIterator::new(py, &self.doc, children)
     }
 
     /// Iterate descendant elements, optionally filtered by tag name.
+    ///
+    /// When filtered by tag, uses posting list binary search: O(log n + k)
+    /// instead of O(subtree_size).
     #[pyo3(signature = (tag=None))]
     fn iter(&self, py: Python<'_>, tag: Option<&str>) -> ElementIterator {
         let doc = self.doc.borrow(py);
         let index = doc.index();
         let start = self.tag_idx;
-        let close = index.matching_close(start).unwrap_or(start);
 
-        let mut descendants = Vec::new();
-        for i in (start + 1)..=close {
-            let tt = index.tag_type(i);
-            if tt == simdxml::index::TagType::Open || tt == simdxml::index::TagType::SelfClose {
-                match tag {
-                    Some(filter) if index.tag_name(i) != filter => {}
-                    _ => descendants.push(i),
+        let descendants = if let Some(filter) = tag {
+            // Fast path: use posting list for filtered iteration
+            let mut result = Vec::new();
+            // Include self if tag matches
+            if index.tag_name_eq(start, filter) {
+                result.push(start);
+            }
+            // Descendants via posting list
+            result.extend(descendants_by_name(index, start, filter));
+            result
+        } else {
+            // Unfiltered: linear scan (all elements)
+            let close = index.matching_close(start).unwrap_or(start);
+            let mut result = Vec::with_capacity(
+                (close - start).min(1024),
+            );
+            // Include self
+            let self_tt = index.tag_type(start);
+            if self_tt == simdxml::index::TagType::Open
+                || self_tt == simdxml::index::TagType::SelfClose
+            {
+                result.push(start);
+            }
+            for i in (start + 1)..=close {
+                let tt = index.tag_type(i);
+                if tt == simdxml::index::TagType::Open
+                    || tt == simdxml::index::TagType::SelfClose
+                {
+                    result.push(i);
                 }
             }
-        }
-        ElementIterator::new(py, &self.doc, &doc, descendants)
+            result
+        };
+        ElementIterator::new(py, &self.doc, descendants)
     }
 
     /// All direct child tag names as a list (single FFI call, interned).
@@ -377,9 +402,15 @@ impl Element {
     fn itertext(&self, py: Python<'_>) -> Vec<Py<PyString>> {
         let doc = self.doc.borrow(py);
         let index = doc.index();
-        let mut texts = Vec::new();
-        collect_text_py(py, index, self.tag_idx, &mut texts);
-        texts
+        // Single Rust call: flat text_ranges scan, no per-element callbacks
+        index
+            .itertext_collect(self.tag_idx)
+            .into_iter()
+            .map(|s| {
+                let decoded = XmlIndex::decode_entities(s);
+                PyString::new(py, &decoded).unbind()
+            })
+            .collect()
     }
 
     /// All descendant text concatenated into a single string.
@@ -441,6 +472,179 @@ impl Element {
         Ok(texts)
     }
 
+    /// Find the first matching subelement (ElementTree API).
+    ///
+    /// Uses index-accelerated lookup for simple paths (O(children) or O(log n)
+    /// via posting lists). Falls back to XPath for complex paths.
+    #[pyo3(signature = (path, _namespaces=None))]
+    fn find(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        _namespaces: Option<&Bound<'_, pyo3::PyAny>>,
+    ) -> PyResult<Option<Element>> {
+        let doc = self.doc.borrow(py);
+        let index = doc.index();
+
+        // Fast path: bare tag name → first child with that name
+        if is_simple_tag(path) {
+            for &child in index.child_slice(self.tag_idx) {
+                if index.tag_name_eq(child as usize, path) {
+                    return Ok(Some(Document::make_element_borrowed(
+                        py, &self.doc, &doc, child as usize,
+                    )));
+                }
+            }
+            return Ok(None);
+        }
+
+        // Fast path: .//tag or //tag → first descendant via posting list
+        if let Some(tag) = descendant_tag_name(path) {
+            if let Some(idx) = first_descendant_by_name(index, self.tag_idx, tag) {
+                return Ok(Some(Document::make_element_borrowed(
+                    py, &self.doc, &doc, idx,
+                )));
+            }
+            return Ok(None);
+        }
+
+        // Fast path: * → first child
+        if path == "*" {
+            return Ok(index
+                .child_at(self.tag_idx, 0)
+                .map(|idx| Document::make_element_borrowed(py, &self.doc, &doc, idx)));
+        }
+
+        // Fallback: full XPath
+        let xpath = et_path_to_xpath(path);
+        let nodes = index
+            .xpath_from(&xpath, self.tag_idx)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        for node in &nodes {
+            if let XPathNode::Element(idx) = node {
+                return Ok(Some(Document::make_element_borrowed(
+                    py, &self.doc, &doc, *idx,
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Find all matching subelements (ElementTree API).
+    ///
+    /// Uses index-accelerated lookup for simple paths. Returns an ElementList
+    /// (lazy — elements created on access).
+    #[pyo3(signature = (path, _namespaces=None))]
+    fn findall(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        _namespaces: Option<&Bound<'_, pyo3::PyAny>>,
+    ) -> PyResult<ElementList> {
+        let doc = self.doc.borrow(py);
+        let index = doc.index();
+
+        // Fast path: bare tag name → children with that name
+        if is_simple_tag(path) {
+            let indices: Vec<usize> = index
+                .child_slice(self.tag_idx)
+                .iter()
+                .filter(|&&c| index.tag_name_eq(c as usize, path))
+                .map(|&c| c as usize)
+                .collect();
+            return Ok(ElementList {
+                doc: self.doc.clone_ref(py),
+                indices,
+            });
+        }
+
+        // Fast path: .//tag → descendants via posting list
+        if let Some(tag) = descendant_tag_name(path) {
+            let indices = descendants_by_name(index, self.tag_idx, tag);
+            return Ok(ElementList {
+                doc: self.doc.clone_ref(py),
+                indices,
+            });
+        }
+
+        // Fast path: * → all children
+        if path == "*" {
+            let indices: Vec<usize> = index
+                .child_slice(self.tag_idx)
+                .iter()
+                .map(|&c| c as usize)
+                .collect();
+            return Ok(ElementList {
+                doc: self.doc.clone_ref(py),
+                indices,
+            });
+        }
+
+        // Fallback: full XPath
+        let xpath = et_path_to_xpath(path);
+        self.xpath(py, &xpath)
+    }
+
+    /// Iterate over matching subelements (ElementTree API).
+    #[pyo3(signature = (path, _namespaces=None))]
+    fn iterfind(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        _namespaces: Option<&Bound<'_, pyo3::PyAny>>,
+    ) -> PyResult<ElementIterator> {
+        let list = self.findall(py, path, _namespaces)?;
+        let _doc_ref = self.doc.borrow(py);
+        Ok(ElementIterator::new(py, &self.doc, list.indices))
+    }
+
+    /// Find text of first matching subelement (ElementTree API).
+    ///
+    /// Uses index-accelerated lookup for the element, then direct_text_first
+    /// for the text. No XPath evaluation for simple paths.
+    #[pyo3(signature = (path, default=None, _namespaces=None))]
+    fn findtext(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        default: Option<&str>,
+        _namespaces: Option<&Bound<'_, pyo3::PyAny>>,
+    ) -> PyResult<Option<Py<PyString>>> {
+        let doc = self.doc.borrow(py);
+        let index = doc.index();
+
+        // Find the element using fast paths
+        let found = if is_simple_tag(path) {
+            index
+                .child_slice(self.tag_idx)
+                .iter()
+                .find(|&&c| index.tag_name_eq(c as usize, path))
+                .map(|&c| c as usize)
+        } else if let Some(tag) = descendant_tag_name(path) {
+            first_descendant_by_name(index, self.tag_idx, tag)
+        } else {
+            // XPath fallback
+            let xpath = et_path_to_xpath(path);
+            let nodes = index
+                .xpath_from(&xpath, self.tag_idx)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            nodes.into_iter().find_map(|n| match n {
+                XPathNode::Element(idx) => Some(idx),
+                _ => None,
+            })
+        };
+
+        match found {
+            Some(idx) => {
+                // Element exists: return text or "" (matching stdlib behavior)
+                let text = index.direct_text_first(idx).unwrap_or("");
+                let decoded = XmlIndex::decode_entities(text);
+                Ok(Some(PyString::new(py, &decoded).unbind()))
+            }
+            None => Ok(default.map(|s| PyString::new(py, s).unbind())),
+        }
+    }
+
     /// Parent element, or None for root.
     fn getparent(&self, py: Python<'_>) -> Option<Element> {
         let doc = self.doc.borrow(py);
@@ -483,6 +687,15 @@ impl Element {
         PyString::new(py, raw).unbind()
     }
 
+    /// Serialize this element to C14N canonical XML.
+    ///
+    /// Attributes sorted, empty elements expanded. Single Rust call.
+    fn c14n(&self, py: Python<'_>) -> Py<PyString> {
+        let doc = self.doc.borrow(py);
+        let result = doc.index().canonicalize(self.tag_idx);
+        PyString::new(py, &result).unbind()
+    }
+
     // -- Read-only enforcement --
 
     #[setter]
@@ -503,6 +716,20 @@ impl Element {
     /// Not supported. Raises TypeError (simdxml elements are read-only).
     #[pyo3(name = "set")]
     fn set_attr(&self, _key: &str, _value: &str) -> PyResult<()> {
+        Err(readonly_error())
+    }
+
+    /// Not supported. Raises TypeError (simdxml elements are read-only).
+    fn extend(&self, _elements: &Bound<'_, pyo3::PyAny>) -> PyResult<()> {
+        Err(readonly_error())
+    }
+
+    /// Not supported. Raises TypeError (simdxml elements are read-only).
+    fn makeelement(
+        &self,
+        _tag: &str,
+        _attrib: &Bound<'_, pyo3::PyAny>,
+    ) -> PyResult<Element> {
         Err(readonly_error())
     }
 
@@ -554,29 +781,21 @@ impl Element {
 }
 
 // ---------------------------------------------------------------------------
-// ElementIterator — pre-caches interned tags to avoid per-next borrow
+// ElementIterator — lazy, creates Elements on demand in __next__
 // ---------------------------------------------------------------------------
 
 #[pyclass]
 struct ElementIterator {
     doc: Py<Document>,
-    items: Vec<(usize, Py<PyString>)>,
+    indices: Vec<usize>,
     pos: usize,
 }
 
 impl ElementIterator {
-    fn new(py: Python<'_>, doc: &Py<Document>, doc_ref: &Document, indices: Vec<usize>) -> Self {
-        let index = doc_ref.index();
-        let items: Vec<(usize, Py<PyString>)> = indices
-            .into_iter()
-            .map(|idx| {
-                let tag = doc_ref.interned_tag(py, index, idx);
-                (idx, tag)
-            })
-            .collect();
+    fn new(py: Python<'_>, doc: &Py<Document>, indices: Vec<usize>) -> Self {
         ElementIterator {
             doc: doc.clone_ref(py),
-            items,
+            indices,
             pos: 0,
         }
     }
@@ -589,13 +808,17 @@ impl ElementIterator {
     }
 
     fn __next__(&mut self, py: Python<'_>) -> Option<Element> {
-        if self.pos < self.items.len() {
-            let (idx, ref cached_tag) = self.items[self.pos];
+        if self.pos < self.indices.len() {
+            let idx = self.indices[self.pos];
             self.pos += 1;
+            // Single borrow per __next__: look up interned tag + create Element
+            let doc_ref = self.doc.borrow(py);
+            let index = doc_ref.index();
+            let cached_tag = doc_ref.interned_tag(py, index, idx);
             Some(Element {
                 doc: self.doc.clone_ref(py),
                 tag_idx: idx,
-                cached_tag: cached_tag.clone_ref(py),
+                cached_tag,
             })
         } else {
             None
@@ -603,7 +826,7 @@ impl ElementIterator {
     }
 
     fn __len__(&self) -> usize {
-        self.items.len() - self.pos
+        self.indices.len() - self.pos
     }
 }
 
@@ -641,8 +864,8 @@ impl ElementList {
     }
 
     fn __iter__(&self, py: Python<'_>) -> ElementIterator {
-        let doc_ref = self.doc.borrow(py);
-        ElementIterator::new(py, &self.doc, &doc_ref, self.indices.clone())
+        let _doc_ref = self.doc.borrow(py);
+        ElementIterator::new(py, &self.doc, self.indices.clone())
     }
 
     fn __bool__(&self) -> bool {
@@ -759,30 +982,103 @@ impl CompiledXPath {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Check if a path is a simple bare tag name (no axes, predicates, wildcards).
+/// Conservative: excludes namespaced tags ({ns}tag, ns:tag) and anything
+/// that could be a complex ET path. Falls through to XPath for those cases.
+fn is_simple_tag(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('/')
+        && !path.contains('[')
+        && !path.contains('(')
+        && !path.contains('*')
+        && !path.contains('.')
+        && !path.contains(':')
+        && !path.contains('@')
+        && !path.contains('{')
+}
+
+/// Extract tag name from `.//tag` or `//tag` patterns.
+/// Returns None for complex paths.
+fn descendant_tag_name(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix(".//").or_else(|| path.strip_prefix("//"))?;
+    if is_simple_tag(rest) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+/// Find first descendant with a given tag name using the posting list.
+/// O(log n) via binary search on the sorted posting list.
+fn first_descendant_by_name(index: &XmlIndex<'_>, parent_idx: usize, tag: &str) -> Option<usize> {
+    let close = index.matching_close(parent_idx).unwrap_or(parent_idx);
+    let posting = index.tags_by_name(tag);
+    if posting.is_empty() {
+        return None;
+    }
+    // Binary search for first posting entry > parent_idx
+    let start = posting.partition_point(|&p| (p as usize) <= parent_idx);
+    for &p in &posting[start..] {
+        let idx = p as usize;
+        if idx > close {
+            break;
+        }
+        return Some(idx);
+    }
+    None
+}
+
+/// Find all descendants with a given tag name using the posting list.
+/// O(k + log n) where k = number of matches.
+fn descendants_by_name(index: &XmlIndex<'_>, parent_idx: usize, tag: &str) -> Vec<usize> {
+    let close = index.matching_close(parent_idx).unwrap_or(parent_idx);
+    let posting = index.tags_by_name(tag);
+    if posting.is_empty() {
+        return Vec::new();
+    }
+    let start = posting.partition_point(|&p| (p as usize) <= parent_idx);
+    posting[start..]
+        .iter()
+        .take_while(|&&p| (p as usize) <= close)
+        .map(|&p| p as usize)
+        .collect()
+}
+
+/// Convert ElementTree path syntax to XPath.
+///
+/// ET paths are a limited subset of XPath:
+/// - `tag` → `./tag` (child)
+/// - `{ns}tag` → pass through
+/// - `*` → `*` (wildcard)
+/// - `.` → `.` (self)
+/// - `..` → `..` (parent)
+/// - `.//tag` → `.//tag` (descendant)
+/// - `//tag` → `.//tag` (descendant from context)
+/// - `[tag]` → `[tag]` (child element predicate)
+/// - `[@attrib]` → `[@attrib]` (attribute predicate)
+/// - `[tag='text']` → `[tag='text']` (child text predicate)
+fn et_path_to_xpath(path: &str) -> String {
+    // Already valid XPath (starts with / or ( or .)
+    if path.starts_with('/') || path.starts_with('(') {
+        if path.starts_with("//") {
+            // ET `//tag` means descendant from context → `.//tag`
+            return format!(".{path}");
+        }
+        return path.to_string();
+    }
+    if path.starts_with('.') {
+        return path.to_string();
+    }
+    // Bare tag name or path without leading dot → make relative
+    format!("./{path}")
+}
+
 fn readonly_error() -> PyErr {
     PyTypeError::new_err(
         "simdxml Elements are read-only. Use xml.etree.ElementTree for XML construction.",
     )
 }
 
-/// Recursively collect text content depth-first, building PyStrings directly.
-fn collect_text_py(
-    py: Python<'_>,
-    index: &XmlIndex<'_>,
-    tag_idx: usize,
-    out: &mut Vec<Py<PyString>>,
-) {
-    for text in index.direct_text(tag_idx) {
-        if !text.is_empty() {
-            let decoded = XmlIndex::decode_entities(text);
-            out.push(PyString::new(py, &decoded).unbind());
-        }
-    }
-    // Use child_slice for zero-alloc child enumeration
-    for &child in index.child_slice(tag_idx) {
-        collect_text_py(py, index, child as usize, out);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Module-level functions
@@ -792,8 +1088,12 @@ fn collect_text_py(
 ///
 /// Accepts bytes or str. For bytes input, the buffer is used directly (zero-copy).
 /// For str input, the string is encoded to UTF-8 bytes.
+///
+/// Set `parallel=True` to use multi-threaded parsing for large documents
+/// (>256KB). Splits SIMD structural indexing across available cores.
 #[pyfunction]
-fn parse(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Document> {
+#[pyo3(signature = (data, *, parallel=false))]
+fn parse(py: Python<'_>, data: &Bound<'_, PyAny>, parallel: bool) -> PyResult<Document> {
     let owner = if data.is_instance_of::<PyBytes>() {
         let backed: PyBackedBytes = data.extract()?;
         DocumentOwner::ZeroCopy(backed)
@@ -804,8 +1104,15 @@ fn parse(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Document> {
     };
 
     let inner = DocumentInner::try_new(owner, |owner| {
-        let mut index =
-            simdxml::parse(owner).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let mut index = if parallel {
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            simdxml::parallel::parse_parallel(owner, threads)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?
+        } else {
+            simdxml::parse(owner).map_err(|e| PyValueError::new_err(e.to_string()))?
+        };
         index.ensure_indices();
         index.build_name_index();
         Ok::<_, PyErr>(index)
@@ -858,6 +1165,86 @@ fn compile(expr: &str) -> PyResult<CompiledXPath> {
     Ok(CompiledXPath { inner })
 }
 
+/// Evaluate an XPath expression across multiple documents with bloom prefilter.
+///
+/// Skips documents that can't match at ~10 GiB/s, then parses only
+/// those that might. Returns one list of text results per document.
+/// This is the fastest path for ETL workloads over many files.
+#[pyfunction]
+fn batch_xpath_text(
+    py: Python<'_>,
+    docs: &Bound<'_, pyo3::types::PyList>,
+    expr: &CompiledXPath,
+) -> PyResult<Vec<Vec<Py<PyString>>>> {
+    let byte_vecs: Vec<Vec<u8>> = docs
+        .iter()
+        .map(|item| {
+            if let Ok(b) = item.cast::<PyBytes>() {
+                Ok(b.as_bytes().to_vec())
+            } else if let Ok(s) = item.extract::<String>() {
+                Ok(s.into_bytes())
+            } else {
+                Err(PyTypeError::new_err("batch items must be bytes or str"))
+            }
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let doc_refs: Vec<&[u8]> = byte_vecs.iter().map(|v| v.as_slice()).collect();
+    let results = simdxml::batch::eval_batch_text_bloom(&doc_refs, &expr.inner)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(results
+        .into_iter()
+        .map(|doc_results| {
+            doc_results
+                .into_iter()
+                .map(|s| PyString::new(py, &s).unbind())
+                .collect()
+        })
+        .collect())
+}
+
+/// Evaluate an XPath expression across multiple documents in parallel.
+///
+/// Uses multiple threads for both parsing and evaluation. Best for
+/// large batches of medium-to-large documents.
+#[pyfunction]
+#[pyo3(signature = (docs, expr, max_threads=None))]
+fn batch_xpath_text_parallel(
+    py: Python<'_>,
+    docs: &Bound<'_, pyo3::types::PyList>,
+    expr: &CompiledXPath,
+    max_threads: Option<usize>,
+) -> PyResult<Vec<Vec<Py<PyString>>>> {
+    let byte_vecs: Vec<Vec<u8>> = docs
+        .iter()
+        .map(|item| {
+            if let Ok(b) = item.cast::<PyBytes>() {
+                Ok(b.as_bytes().to_vec())
+            } else if let Ok(s) = item.extract::<String>() {
+                Ok(s.into_bytes())
+            } else {
+                Err(PyTypeError::new_err("batch items must be bytes or str"))
+            }
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let doc_refs: Vec<&[u8]> = byte_vecs.iter().map(|v| v.as_slice()).collect();
+    let threads = max_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    });
+    let results = simdxml::batch::eval_batch_parallel(&doc_refs, &expr.inner, threads)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(results
+        .into_iter()
+        .map(|doc_results| {
+            doc_results
+                .into_iter()
+                .map(|s| PyString::new(py, &s).unbind())
+                .collect()
+        })
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
@@ -870,5 +1257,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompiledXPath>()?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_xpath_text, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_xpath_text_parallel, m)?)?;
     Ok(())
 }

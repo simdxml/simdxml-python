@@ -72,11 +72,18 @@ expr.eval_text(doc)                # -> list[str]
 expr.eval_count(doc)               # -> int
 expr.eval_exists(doc)              # -> bool
 expr.eval(doc)                     # -> list[Element]
+
+# Batch: process many documents in one call
+docs = [open(f).read() for f in xml_files]
+expr = simdxml.compile("//title")
+simdxml.batch_xpath_text(docs, expr)           # bloom prefilter
+simdxml.batch_xpath_text_parallel(docs, expr)  # multithreaded
 ```
 
-### ElementTree compatibility
+### ElementTree drop-in (read-only)
 
-Drop-in replacement for `xml.etree.ElementTree` (read-only):
+Full read-only drop-in replacement for `xml.etree.ElementTree`. Every
+read-only Element method and module function is supported:
 
 ```python
 from simdxml.etree import ElementTree as ET
@@ -84,17 +91,31 @@ from simdxml.etree import ElementTree as ET
 tree = ET.parse("books.xml")
 root = tree.getroot()
 
-# stdlib-compatible API
-root.tag                           # element tag name
-root.text                          # direct text content
-root.attrib                        # attribute dict
-root.get("key")                    # attribute access
+# All stdlib Element methods work
+root.tag, root.text, root.tail, root.attrib
+root.find(".//title")              # first match
+root.findall(".//book[@lang]")     # all matches
+root.findtext(".//title")          # text of first match
+root.iterfind(".//author")         # iterator
 root.iter("title")                 # descendant iterator
 root.itertext()                    # text iterator
+root.get("key"), root.keys(), root.items()
+len(root), root[0], list(root)
 
-# Full XPath 1.0 (lxml-compatible extension)
+# All stdlib module functions work
+ET.parse(file), ET.fromstring(text), ET.tostring(element)
+ET.iterparse(file, events=("start", "end"))
+ET.canonicalize(xml), ET.dump(element), ET.iselement(obj)
+ET.XMLPullParser(events=("end",)), ET.XMLParser(), ET.TreeBuilder()
+ET.fromstringlist(seq), ET.tostringlist(elem)
+ET.QName(uri, tag), ET.XMLID(text)
+
+# Plus full XPath 1.0 (lxml-compatible extension)
 root.xpath("//book[contains(title, 'XML')]")
 ```
+
+Mutation operations (`append`, `remove`, `set`, `SubElement`, `indent`, etc.)
+raise `TypeError` with a helpful message pointing to stdlib.
 
 ### Read-only by design
 
@@ -122,59 +143,46 @@ Full conformance with XPath 1.0:
 
 ## Benchmarks
 
-Apple Silicon, Python 3.14, lxml 6.0. GC disabled during timing, 3 warmup +
-20 timed iterations, median reported. Three corpus types: data-oriented
-(product catalog), document-oriented (PubMed abstracts), config-oriented
-(Maven POM). Run yourself: `uv run python bench/bench_parse.py`
+Apple Silicon, Python 3.14, lxml 6.0. GC disabled, 3 warmup + 20 timed
+iterations, median reported. 100K-element catalog (5.6 MB).
+Run yourself: `uv run python bench/bench_parse.py`
 
-### Parse
+Faster than lxml on every operation. Faster than stdlib on 11 of 14.
 
-`simdxml.parse()` eagerly builds structural indices (CSR, name posting).
-lxml's `fromstring()` builds a DOM tree without precomputed query indices.
-simdxml front-loads more work into parse so queries are faster — both numbers
-are real, the trade-off depends on your workload.
+| Operation | simdxml | lxml | stdlib | vs lxml | vs stdlib |
+|-----------|---------|------|--------|---------|-----------|
+| `parse()` | 10 ms | 33 ms | 55 ms | **3x** | **5x** |
+| `find("item")` | <1 us | 1 us | <1 us | **faster** | **tied** |
+| `find(".//name")` | <1 us | 1 us | 1 us | **faster** | **faster** |
+| `findall("item")` | 0.23 ms | 4.8 ms | 0.89 ms | **21x** | **4x** |
+| `findall(".//item")` | 0.15 ms | 6.2 ms | 3.0 ms | **42x** | **20x** |
+| `findall(predicate)` | 1.5 ms | 12 ms | 4.9 ms | **8x** | **3x** |
+| `findtext(".//name")` | <1 us | 1 us | 1 us | **faster** | **faster** |
+| `xpath_text("//name")` | 2.1 ms | 19 ms | 4.4 ms | **9x** | **2x** |
+| `iter()` | 9.2 ms | 15 ms | 1.3 ms | **2x** | 0.14x |
+| `iter("item")` filtered | 4.5 ms | 5.9 ms | 1.9 ms | **1.3x** | 0.4x |
+| `itertext()` | 2.6 ms | 33 ms | 1.4 ms | **13x** | 0.5x |
+| `child_tags()` | 0.40 ms | 6.2 ms | 1.5 ms | **16x** | **4x** |
+| `iterparse()` | 51 ms | 66 ms | 70 ms | **1.3x** | **1.4x** |
+| `canonicalize()` | 1.8 ms | 4.7 ms | 4.6 ms | **3x** | **3x** |
 
-| Corpus | Size | simdxml | lxml | vs lxml | vs stdlib |
-|--------|------|---------|------|---------|-----------|
-| Catalog (data) | 1.6 MB | 2.7 ms | 8.1 ms | **3.0x** | **5.4x** |
-| Catalog (data) | 17 MB | 32 ms | 82 ms | **2.6x** | **4.7x** |
-| PubMed (doc) | 1.7 MB | 2.3 ms | 6.0 ms | **2.7x** | **5.9x** |
-| PubMed (doc) | 17 MB | 27 ms | 61 ms | **2.2x** | **5.0x** |
-| POM (config) | 2.1 MB | 2.7 ms | 8.3 ms | **3.1x** | **6.6x** |
+The three operations where stdlib is faster (`iter`, `itertext`, `iter` filtered)
+involve creating per-element Python objects. The batch alternatives
+(`child_tags()`, `xpath_text()`) beat both lxml and stdlib for those workloads.
 
-### XPath queries (returning Elements — apples-to-apples)
+### Batch processing (multiple documents)
 
-| Query | Corpus | simdxml | lxml | vs lxml |
-|-------|--------|---------|------|---------|
-| `//item` | Catalog 17 MB | 3.4 ms | 21 ms | **6x** |
-| `//item[@category="cat5"]` | Catalog 17 MB | 1.6 ms | 69 ms | **42x** |
-| `//PubmedArticle` | PubMed 17 MB | 0.35 ms | 9.8 ms | **28x** |
-| `//Author[LastName="Auth0_0"]` | PubMed 17 MB | 13 ms | 29 ms | **2.2x** |
-| `//dependency` | POM 2.1 MB | 0.34 ms | 1.1 ms | **3.3x** |
-| `//dependency[scope="test"]` | POM 2.1 MB | 2.4 ms | 3.6 ms | **1.5x** |
+`batch_xpath_text` uses a bloom filter to skip non-matching documents at
+~10 GiB/s. `batch_xpath_text_parallel` spreads parse + eval across threads.
+Both return all results in a single FFI call — zero per-document Python overhead.
 
-### XPath text extraction
+| Workload | Python loop | bloom batch | parallel batch |
+|----------|-------------|-------------|----------------|
+| 1K small docs | 1.1 ms | **0.37 ms** (3x) | 12 ms |
+| 100x 31KB docs | 7.9 ms | 8.2 ms | **2.6 ms** (3x) |
 
-`xpath_text()` returns strings directly, avoiding Element object creation.
-This is the optimized path for ETL / data extraction workloads.
-
-| Query | Corpus | simdxml | lxml xpath+.text | vs lxml |
-|-------|--------|---------|------------------|---------|
-| `//name` | Catalog 17 MB | 1.8 ms | 37 ms | **20x** |
-| `//AbstractText` | PubMed 17 MB | 0.31 ms | 7.1 ms | **23x** |
-| `//artifactId` | POM 2.1 MB | 0.21 ms | 2.0 ms | **10x** |
-
-### Element traversal
-
-`child_tags()` and `descendant_tags()` return all tag names in a single
-call using interned Python strings. Per-element iteration (`for e in root`)
-is also available but creates Element objects with some overhead.
-
-| Corpus | `child_tags()` | lxml `[e.tag]` | vs lxml |
-|--------|----------------|-----------------|---------|
-| Catalog 17 MB | **0.38 ms** | 6.4 ms | **17x** |
-| PubMed 17 MB | **0.03 ms** | 0.60 ms | **17x** |
-| POM 2.1 MB | **0.2 us** | 0.5 us | **3x** |
+Use bloom batch when many documents won't match the query (ETL filtering).
+Use parallel batch when documents are large (>10KB) and most will match.
 
 ## How it works
 

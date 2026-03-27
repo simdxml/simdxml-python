@@ -35,6 +35,8 @@ from simdxml._core import (
     Document,
     Element,
     ElementList,
+    batch_xpath_text,
+    batch_xpath_text_parallel,
     compile,
     parse,
 )
@@ -44,8 +46,10 @@ __all__ = [
     "Document",
     "Element",
     "ElementList",
+    "batch_xpath_text",
+    "batch_xpath_text_parallel",
     "compile",
     "parse",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
