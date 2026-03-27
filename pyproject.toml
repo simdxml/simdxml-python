@@ -1,6 +1,6 @@
 [project]
 name = "simdxml"
-version = "0.1.0"
+version = "0.2.0"
 description = "SIMD-accelerated XML parser with full XPath 1.0 support"
 readme = "README.md"
 authors = [

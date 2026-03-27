@@ -62,6 +62,10 @@ elem.getprevious()                 # previous sibling or None
 elem.xpath(".//title")             # context-node evaluation
 elem.xpath_text("author")         # text extraction from context
 
+# Batch APIs (single FFI call, interned strings)
+root.child_tags()                  # -> list[str] of child tag names
+root.descendant_tags("item")       # -> list[str] filtered by tag
+
 # Compiled XPath (like re.compile)
 expr = simdxml.compile("//title")
 expr.eval_text(doc)                # -> list[str]
@@ -118,33 +122,59 @@ Full conformance with XPath 1.0:
 
 ## Benchmarks
 
-Measured on Apple Silicon (M-series), Python 3.14, comparing against
-lxml 6.0 and stdlib `xml.etree.ElementTree`. Run with `uv run python bench/bench_parse.py`.
+Apple Silicon, Python 3.14, lxml 6.0. GC disabled during timing, 3 warmup +
+20 timed iterations, median reported. Three corpus types: data-oriented
+(product catalog), document-oriented (PubMed abstracts), config-oriented
+(Maven POM). Run yourself: `uv run python bench/bench_parse.py`
 
-### Parse throughput
+### Parse
 
-| Document | simdxml | lxml | stdlib ET | vs lxml | vs stdlib |
-|----------|---------|------|-----------|---------|-----------|
-| 20 KB (100 items) | 0.05 ms | 0.09 ms | 0.15 ms | 1.8x | 3.0x |
-| 2 MB (10K items) | 3.3 ms | 8.5 ms | 16.7 ms | 2.6x | 5.0x |
-| 20 MB (100K items) | 40 ms | 87 ms | 181 ms | **2.2x** | **4.5x** |
+`simdxml.parse()` eagerly builds structural indices (CSR, name posting).
+lxml's `fromstring()` builds a DOM tree without precomputed query indices.
+simdxml front-loads more work into parse so queries are faster — both numbers
+are real, the trade-off depends on your workload.
 
-### XPath query: `//name`
+| Corpus | Size | simdxml | lxml | vs lxml | vs stdlib |
+|--------|------|---------|------|---------|-----------|
+| Catalog (data) | 1.6 MB | 2.7 ms | 8.1 ms | **3.0x** | **5.4x** |
+| Catalog (data) | 17 MB | 32 ms | 82 ms | **2.6x** | **4.7x** |
+| PubMed (doc) | 1.7 MB | 2.3 ms | 6.0 ms | **2.7x** | **5.9x** |
+| PubMed (doc) | 17 MB | 27 ms | 61 ms | **2.2x** | **5.0x** |
+| POM (config) | 2.1 MB | 2.7 ms | 8.3 ms | **3.1x** | **6.6x** |
 
-| Document | simdxml | lxml | stdlib findall | vs lxml | vs stdlib |
-|----------|---------|------|----------------|---------|-----------|
-| 2 MB | 0.3 ms | 1.0 ms | 0.7 ms | 3.1x | 2.1x |
-| 20 MB | 3.8 ms | 19.7 ms | 7.3 ms | **5.2x** | **1.9x** |
+### XPath queries (returning Elements — apples-to-apples)
 
-### XPath query with predicate: `//item[@category="cat5"]`
+| Query | Corpus | simdxml | lxml | vs lxml |
+|-------|--------|---------|------|---------|
+| `//item` | Catalog 17 MB | 3.4 ms | 21 ms | **6x** |
+| `//item[@category="cat5"]` | Catalog 17 MB | 1.6 ms | 69 ms | **42x** |
+| `//PubmedArticle` | PubMed 17 MB | 0.35 ms | 9.8 ms | **28x** |
+| `//Author[LastName="Auth0_0"]` | PubMed 17 MB | 13 ms | 29 ms | **2.2x** |
+| `//dependency` | POM 2.1 MB | 0.34 ms | 1.1 ms | **3.3x** |
+| `//dependency[scope="test"]` | POM 2.1 MB | 2.4 ms | 3.6 ms | **1.5x** |
 
-| Document | simdxml | lxml | stdlib findall | vs lxml |
-|----------|---------|------|----------------|---------|
-| 2 MB | 0.2 ms | 2.8 ms | 0.8 ms | 16x |
-| 20 MB | 2.0 ms | 46 ms | 9.1 ms | **23x** |
+### XPath text extraction
 
-The predicate speedup is dramatic because simdxml's structural index enables
-direct attribute comparison without materializing DOM nodes.
+`xpath_text()` returns strings directly, avoiding Element object creation.
+This is the optimized path for ETL / data extraction workloads.
+
+| Query | Corpus | simdxml | lxml xpath+.text | vs lxml |
+|-------|--------|---------|------------------|---------|
+| `//name` | Catalog 17 MB | 1.8 ms | 37 ms | **20x** |
+| `//AbstractText` | PubMed 17 MB | 0.31 ms | 7.1 ms | **23x** |
+| `//artifactId` | POM 2.1 MB | 0.21 ms | 2.0 ms | **10x** |
+
+### Element traversal
+
+`child_tags()` and `descendant_tags()` return all tag names in a single
+call using interned Python strings. Per-element iteration (`for e in root`)
+is also available but creates Element objects with some overhead.
+
+| Corpus | `child_tags()` | lxml `[e.tag]` | vs lxml |
+|--------|----------------|-----------------|---------|
+| Catalog 17 MB | **0.38 ms** | 6.4 ms | **17x** |
+| PubMed 17 MB | **0.03 ms** | 0.60 ms | **17x** |
+| POM 2.1 MB | **0.2 us** | 0.5 us | **3x** |
 
 ## How it works
 
@@ -157,7 +187,8 @@ and parents -- all indexed by the same position.
 - O(1) ancestor/descendant checks via pre/post-order numbering
 - O(1) child enumeration via CSR (Compressed Sparse Row) indices
 - SIMD-accelerated structural parsing (NEON on ARM, AVX2 on x86)
-- Lazy index building: CSR indices built on first query, not at parse time
+- Parse eagerly builds all indices (CSR, name posting, parent map) so
+  subsequent queries pay zero index construction cost
 
 ## Platform support
 

@@ -1,6 +1,6 @@
 [package]
 name = "simdxml-python"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -9,5 +9,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
-simdxml = "0.1"
+simdxml = "0.2"
 self_cell = "1"
