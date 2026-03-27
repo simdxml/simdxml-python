@@ -43,7 +43,7 @@ target-version = "py39"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "RUF", "B", "SIM", "PTH"]
-ignore = ["N999"]  # ElementTree.py is a stdlib-compat module name
+ignore = ["N999", "N802"]  # ElementTree.py has stdlib-compat names
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["N817", "PTH123"]  # ET alias, open() in test helpers

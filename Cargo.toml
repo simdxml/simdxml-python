@@ -9,5 +9,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
-simdxml = "0.2"
+simdxml = "0.2.1"
 self_cell = "1"
