@@ -1,4 +1,5 @@
 use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::pybacked::PyBackedBytes;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use self_cell::self_cell;
@@ -9,19 +10,37 @@ use simdxml::XmlIndex;
 // Self-referential Document: owns bytes + XmlIndex + derived data
 // ---------------------------------------------------------------------------
 
+/// Owner type: either zero-copy from Python bytes or owned from str input.
+enum DocumentOwner {
+    /// Zero-copy: borrows directly from Python bytes object's internal buffer.
+    ZeroCopy(PyBackedBytes),
+    /// Owned: copied from str input (Python str -> UTF-8 bytes).
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for DocumentOwner {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            DocumentOwner::ZeroCopy(b) => b,
+            DocumentOwner::Owned(v) => v,
+        }
+    }
+}
+
 struct IndexWithMeta<'a> {
     index: XmlIndex<'a>,
     /// parent[i] = tag index of parent element. u32::MAX = root.
     parents: Vec<u32>,
     /// name_id[i] = index into interned names for tag i. usize::MAX = none.
     name_ids: Vec<usize>,
-    /// Unique tag name strings (one per unique name, used to build Python interned strings).
+    /// Unique tag name strings (used to build Python interned strings at parse time).
     unique_names: Vec<String>,
 }
 
 self_cell!(
     struct DocumentInner {
-        owner: Vec<u8>,
+        owner: DocumentOwner,
         #[covariant]
         dependent: IndexWithMeta,
     }
@@ -29,11 +48,12 @@ self_cell!(
 
 /// A parsed XML document.
 ///
-/// Created by :func:`parse`. Use :attr:`root` to get the root element,
-/// or query directly with :meth:`xpath_text` and :meth:`xpath`.
+/// Created by `parse()`. Use `root` to get the root element,
+/// or query directly with `xpath_text()` and `xpath()`.
 #[pyclass]
 struct Document {
     inner: DocumentInner,
+    /// Interned tag names: unique tag name -> Python str (created once at parse).
     interned_names: Vec<Py<PyString>>,
 }
 
@@ -46,15 +66,18 @@ impl Document {
         self.inner.borrow_dependent()
     }
 
-    fn interned_tag(&self, py: Python<'_>, tag_idx: usize) -> Py<PyString> {
-        let meta = self.meta();
+    /// Look up interned tag when you already have a meta borrow (hot path).
+    fn interned_tag_fast(
+        &self,
+        py: Python<'_>,
+        meta: &IndexWithMeta<'_>,
+        tag_idx: usize,
+    ) -> Py<PyString> {
         let name_id = meta.name_ids[tag_idx];
         if name_id < self.interned_names.len() {
             self.interned_names[name_id].clone_ref(py)
         } else {
-            // Fallback for tags without interned names (comments, PIs, etc.)
-            let name = meta.index.tag_name(tag_idx);
-            PyString::new(py, name).unbind()
+            PyString::new(py, meta.index.tag_name(tag_idx)).unbind()
         }
     }
 
@@ -71,7 +94,8 @@ impl Document {
         doc_ref: &Document,
         tag_idx: usize,
     ) -> Element {
-        let cached_tag = doc_ref.interned_tag(py, tag_idx);
+        let meta = doc_ref.meta();
+        let cached_tag = doc_ref.interned_tag_fast(py, meta, tag_idx);
         Element {
             doc: doc.clone_ref(py),
             tag_idx,
@@ -85,8 +109,16 @@ impl Document {
         doc_ref: &Document,
         tag_indices: impl Iterator<Item = usize>,
     ) -> Vec<Element> {
+        let meta = doc_ref.meta();
         tag_indices
-            .map(|idx| Self::make_element_borrowed(py, doc, doc_ref, idx))
+            .map(|idx| {
+                let cached_tag = doc_ref.interned_tag_fast(py, meta, idx);
+                Element {
+                    doc: doc.clone_ref(py),
+                    tag_idx: idx,
+                    cached_tag,
+                }
+            })
             .collect()
     }
 }
@@ -96,22 +128,30 @@ impl Document {
     /// Evaluate an XPath expression and return text content of matches.
     ///
     /// Returns the direct child text of each matching element.
-    fn xpath_text(&self, expr: &str) -> PyResult<Vec<String>> {
+    fn xpath_text(&self, py: Python<'_>, expr: &str) -> PyResult<Vec<Py<PyString>>> {
         let index = self.index();
         let results = index
             .xpath_text(expr)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(results.into_iter().map(|s| s.to_string()).collect())
+        // Return Py<PyString> directly from &str — avoids Rust String intermediary
+        Ok(results
+            .into_iter()
+            .map(|s| PyString::new(py, s).unbind())
+            .collect())
     }
 
     /// Evaluate an XPath expression and return string-values of matches.
     ///
-    /// Returns all descendant text for each match (XPath string() semantics).
-    fn xpath_string(&self, expr: &str) -> PyResult<Vec<String>> {
+    /// Returns all descendant text for each match (XPath `string()` semantics).
+    fn xpath_string(&self, py: Python<'_>, expr: &str) -> PyResult<Vec<Py<PyString>>> {
         let index = self.index();
-        index
+        let results = index
             .xpath_string(expr)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(results
+            .into_iter()
+            .map(|s| PyString::new(py, &s).unbind())
+            .collect())
     }
 
     /// Evaluate an XPath expression.
@@ -195,19 +235,8 @@ impl Document {
 struct Element {
     doc: Py<Document>,
     tag_idx: usize,
+    /// Cached tag name (interned Python string).
     cached_tag: Py<PyString>,
-}
-
-impl Element {
-    fn with_index<'py, R>(
-        &self,
-        py: Python<'py>,
-        f: impl FnOnce(&XmlIndex<'_>, &IndexWithMeta<'_>) -> R,
-    ) -> R {
-        let doc = self.doc.borrow(py);
-        let meta = doc.meta();
-        f(&meta.index, meta)
-    }
 }
 
 #[pymethods]
@@ -220,48 +249,51 @@ impl Element {
 
     /// Text content before the first child element, or None.
     ///
-    /// For '<p>Hello <b>world</b></p>', p.text is 'Hello '.
+    /// For `<p>Hello <b>world</b></p>`, `p.text` is `'Hello '`.
     #[getter]
-    fn text(&self, py: Python<'_>) -> Option<String> {
-        self.with_index(py, |index, _| {
-            let texts = index.direct_text(self.tag_idx);
-            if texts.is_empty() {
-                return None;
-            }
-            let first = texts[0];
-            if first.is_empty() {
-                None
-            } else {
-                Some(XmlIndex::decode_entities(first).into_owned())
-            }
-        })
+    fn text(&self, py: Python<'_>) -> Option<Py<PyString>> {
+        let doc = self.doc.borrow(py);
+        let index = doc.index();
+        let texts = index.direct_text(self.tag_idx);
+        if texts.is_empty() {
+            return None;
+        }
+        let first = texts[0];
+        if first.is_empty() {
+            None
+        } else {
+            let decoded = XmlIndex::decode_entities(first);
+            Some(PyString::new(py, &decoded).unbind())
+        }
     }
 
     /// Text content after this element's closing tag, or None.
     ///
-    /// For '<p>Hello <b>world</b> more</p>', b.tail is ' more'.
+    /// For `<p>Hello <b>world</b> more</p>`, `b.tail` is `' more'`.
     #[getter]
-    fn tail(&self, py: Python<'_>) -> Option<String> {
-        self.with_index(py, |index, meta| {
-            let parent = meta.parents[self.tag_idx];
-            if parent == u32::MAX {
-                return None;
-            }
+    fn tail(&self, py: Python<'_>) -> Option<Py<PyString>> {
+        let doc = self.doc.borrow(py);
+        let meta = doc.meta();
+        let parent = meta.parents[self.tag_idx];
+        if parent == u32::MAX {
+            return None;
+        }
 
-            let parent_raw = index.raw_xml(parent as usize);
-            let my_raw = index.raw_xml(self.tag_idx);
+        let index = &meta.index;
+        let parent_raw = index.raw_xml(parent as usize);
+        let my_raw = index.raw_xml(self.tag_idx);
 
-            if let Some(pos) = parent_raw.find(my_raw) {
-                let after = &parent_raw[pos + my_raw.len()..];
-                if let Some(lt) = after.find('<') {
-                    let text = &after[..lt];
-                    if !text.is_empty() {
-                        return Some(XmlIndex::decode_entities(text).into_owned());
-                    }
+        if let Some(pos) = parent_raw.find(my_raw) {
+            let after = &parent_raw[pos + my_raw.len()..];
+            if let Some(lt) = after.find('<') {
+                let text = &after[..lt];
+                if !text.is_empty() {
+                    let decoded = XmlIndex::decode_entities(text);
+                    return Some(PyString::new(py, &decoded).unbind());
                 }
             }
-            None
-        })
+        }
+        None
     }
 
     /// Dictionary of this element's attributes.
@@ -280,47 +312,48 @@ impl Element {
 
     /// Get an attribute value by name, with optional default.
     #[pyo3(signature = (key, default=None))]
-    fn get(&self, py: Python<'_>, key: &str, default: Option<&str>) -> Option<String> {
-        self.with_index(py, |index, _| {
-            index
-                .get_attribute(self.tag_idx, key)
-                .map(|s| s.to_string())
-                .or_else(|| default.map(|s| s.to_string()))
-        })
+    fn get(&self, py: Python<'_>, key: &str, default: Option<&str>) -> Option<Py<PyString>> {
+        let doc = self.doc.borrow(py);
+        let index = doc.index();
+        index
+            .get_attribute(self.tag_idx, key)
+            .map(|s| PyString::new(py, s).unbind())
+            .or_else(|| default.map(|s| PyString::new(py, s).unbind()))
     }
 
     /// Attribute names.
-    fn keys(&self, py: Python<'_>) -> Vec<String> {
-        self.with_index(py, |index, _| {
-            index
-                .get_all_attribute_names(self.tag_idx)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect()
-        })
+    fn keys(&self, py: Python<'_>) -> Vec<Py<PyString>> {
+        let doc = self.doc.borrow(py);
+        let index = doc.index();
+        index
+            .get_all_attribute_names(self.tag_idx)
+            .into_iter()
+            .map(|s| PyString::new(py, s).unbind())
+            .collect()
     }
 
     /// (name, value) attribute pairs.
-    fn items(&self, py: Python<'_>) -> Vec<(String, String)> {
-        self.with_index(py, |index, _| {
-            index
-                .get_all_attribute_names(self.tag_idx)
-                .into_iter()
-                .filter_map(|name| {
-                    index
-                        .get_attribute(self.tag_idx, name)
-                        .map(|val| (name.to_string(), val.to_string()))
+    fn items(&self, py: Python<'_>) -> Vec<(Py<PyString>, Py<PyString>)> {
+        let doc = self.doc.borrow(py);
+        let index = doc.index();
+        index
+            .get_all_attribute_names(self.tag_idx)
+            .into_iter()
+            .filter_map(|name| {
+                index.get_attribute(self.tag_idx, name).map(|val| {
+                    (
+                        PyString::new(py, name).unbind(),
+                        PyString::new(py, val).unbind(),
+                    )
                 })
-                .collect()
-        })
+            })
+            .collect()
     }
 
     /// Number of direct child elements.
-    ///
-    /// >>> len(element)
-    /// 3
     fn __len__(&self, py: Python<'_>) -> usize {
-        self.with_index(py, |index, _| index.children(self.tag_idx).len())
+        let doc = self.doc.borrow(py);
+        doc.index().children(self.tag_idx).len()
     }
 
     /// Get a child element by index. Supports negative indexing.
@@ -360,6 +393,7 @@ impl Element {
         let start = self.tag_idx;
         let close = index.matching_close(start).unwrap_or(start);
 
+        // Linear scan over tag range (not index-accelerated).
         let mut descendants = Vec::new();
         for i in (start + 1)..=close {
             let tt = index.tag_type(i);
@@ -379,24 +413,25 @@ impl Element {
 
     /// All direct child tag names as a list.
     ///
-    /// More efficient than [e.tag for e in element] for bulk access.
+    /// More efficient than `[e.tag for e in element]` for bulk access.
     fn child_tags(&self, py: Python<'_>) -> Vec<Py<PyString>> {
         let doc = self.doc.borrow(py);
-        let index = doc.index();
-        index
+        let meta = doc.meta();
+        meta.index
             .children(self.tag_idx)
             .iter()
-            .map(|&child| doc.interned_tag(py, child))
+            .map(|&child| doc.interned_tag_fast(py, meta, child))
             .collect()
     }
 
     /// All descendant tag names, optionally filtered.
     ///
-    /// More efficient than [e.tag for e in element.iter(tag)] for bulk access.
+    /// More efficient than `[e.tag for e in element.iter(tag)]` for bulk access.
     #[pyo3(signature = (tag=None))]
     fn descendant_tags(&self, py: Python<'_>, tag: Option<&str>) -> Vec<Py<PyString>> {
         let doc = self.doc.borrow(py);
-        let index = doc.index();
+        let meta = doc.meta();
+        let index = &meta.index;
         let start = self.tag_idx;
         let close = index.matching_close(start).unwrap_or(start);
 
@@ -406,7 +441,7 @@ impl Element {
             if tt == simdxml::index::TagType::Open || tt == simdxml::index::TagType::SelfClose {
                 match tag {
                     Some(filter) if index.tag_name(i) != filter => {}
-                    _ => result.push(doc.interned_tag(py, i)),
+                    _ => result.push(doc.interned_tag_fast(py, meta, i)),
                 }
             }
         }
@@ -414,17 +449,19 @@ impl Element {
     }
 
     /// All text content within this element, depth-first.
-    fn itertext(&self, py: Python<'_>) -> Vec<String> {
+    fn itertext(&self, py: Python<'_>) -> Vec<Py<PyString>> {
         let doc = self.doc.borrow(py);
         let index = doc.index();
         let mut texts = Vec::new();
-        collect_text(index, self.tag_idx, &mut texts);
+        collect_text_py(py, index, self.tag_idx, &mut texts);
         texts
     }
 
     /// All descendant text concatenated into a single string.
-    fn text_content(&self, py: Python<'_>) -> String {
-        self.with_index(py, |index, _| index.all_text(self.tag_idx))
+    fn text_content(&self, py: Python<'_>) -> Py<PyString> {
+        let doc = self.doc.borrow(py);
+        let text = doc.index().all_text(self.tag_idx);
+        PyString::new(py, &text).unbind()
     }
 
     /// Evaluate an XPath 1.0 expression with this element as context.
@@ -449,7 +486,7 @@ impl Element {
     }
 
     /// Evaluate an XPath expression and return text content of matches.
-    fn xpath_text(&self, py: Python<'_>, expr: &str) -> PyResult<Vec<String>> {
+    fn xpath_text(&self, py: Python<'_>, expr: &str) -> PyResult<Vec<Py<PyString>>> {
         let doc = self.doc.borrow(py);
         let index = doc.index();
         let results = index
@@ -462,15 +499,17 @@ impl Element {
                 XPathNode::Element(idx) => {
                     let dt = index.direct_text(*idx);
                     if !dt.is_empty() {
-                        texts.push(dt.join(""));
+                        // Build PyString directly from &str slices
+                        let joined: String = dt.iter().copied().collect();
+                        texts.push(PyString::new(py, &joined).unbind());
                     }
                 }
                 XPathNode::Text(idx) => {
-                    texts.push(index.text_by_index(*idx).to_string());
+                    texts.push(PyString::new(py, index.text_by_index(*idx)).unbind());
                 }
                 XPathNode::Attribute(tag_idx, _) => {
-                    if let Some(val) = get_first_attribute(index, *tag_idx) {
-                        texts.push(val);
+                    if let Some(s) = get_first_attribute_str(index, *tag_idx) {
+                        texts.push(PyString::new(py, s).unbind());
                     }
                 }
                 _ => {}
@@ -532,9 +571,11 @@ impl Element {
         }
     }
 
-    /// Raw XML for this element (opening through closing tag).
-    fn tostring(&self, py: Python<'_>) -> String {
-        self.with_index(py, |index, _| index.raw_xml(self.tag_idx).to_string())
+    /// Serialize this element to an XML string.
+    fn tostring(&self, py: Python<'_>) -> Py<PyString> {
+        let doc = self.doc.borrow(py);
+        let raw = doc.index().raw_xml(self.tag_idx);
+        PyString::new(py, raw).unbind()
     }
 
     // -- Read-only enforcement --
@@ -641,7 +682,7 @@ impl ElementIterator {
 
 /// A compiled XPath expression for repeated use.
 ///
-/// Like re.compile() -- parse the expression once, evaluate many times
+/// Like `re.compile()` -- parse the expression once, evaluate many times
 /// across different documents.
 #[pyclass]
 struct CompiledXPath {
@@ -650,17 +691,20 @@ struct CompiledXPath {
 
 #[pymethods]
 impl CompiledXPath {
-    /// Evaluate and return text content of matches.
-    fn eval_text(&self, doc: &Document) -> PyResult<Vec<String>> {
+    /// Evaluate and return text content of matching nodes.
+    fn eval_text(&self, py: Python<'_>, doc: &Document) -> PyResult<Vec<Py<PyString>>> {
         let index = doc.index();
         let results = self
             .inner
             .eval_text(index)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(results.into_iter().map(|s| s.to_string()).collect())
+        Ok(results
+            .into_iter()
+            .map(|s| PyString::new(py, s).unbind())
+            .collect())
     }
 
-    /// Evaluate and return matching Element nodes.
+    /// Evaluate and return matching Element objects.
     fn eval(slf: &Bound<'_, Self>, doc: &Bound<'_, Document>) -> PyResult<Vec<Element>> {
         let this = slf.borrow();
         let doc_ref = doc.borrow();
@@ -683,7 +727,7 @@ impl CompiledXPath {
         ))
     }
 
-    /// Check if any nodes match.
+    /// Check whether any nodes match.
     fn eval_exists(&self, doc: &Document) -> PyResult<bool> {
         let index = doc.index();
         let nodes = self
@@ -693,7 +737,7 @@ impl CompiledXPath {
         Ok(!nodes.is_empty())
     }
 
-    /// Count matching nodes.
+    /// Count the number of matching nodes.
     fn eval_count(&self, doc: &Document) -> PyResult<usize> {
         let index = doc.index();
         let nodes = self
@@ -724,6 +768,13 @@ fn get_first_attribute(index: &XmlIndex<'_>, tag_idx: usize) -> Option<String> {
         .first()
         .and_then(|name| index.get_attribute(tag_idx, name))
         .map(|s| s.to_string())
+}
+
+fn get_first_attribute_str<'a>(index: &'a XmlIndex<'_>, tag_idx: usize) -> Option<&'a str> {
+    let names = index.get_all_attribute_names(tag_idx);
+    names
+        .first()
+        .and_then(|name| index.get_attribute(tag_idx, name))
 }
 
 /// Build parent map, name-id map, and unique name list from the public API.
@@ -773,15 +824,16 @@ fn build_interned_names(py: Python<'_>, unique_names: &[String]) -> Vec<Py<PyStr
         .collect()
 }
 
-/// Recursively collect text content depth-first (for itertext).
-fn collect_text(index: &XmlIndex<'_>, tag_idx: usize, out: &mut Vec<String>) {
+/// Recursively collect text content depth-first, building PyStrings directly.
+fn collect_text_py(py: Python<'_>, index: &XmlIndex<'_>, tag_idx: usize, out: &mut Vec<Py<PyString>>) {
     for text in index.direct_text(tag_idx) {
         if !text.is_empty() {
-            out.push(XmlIndex::decode_entities(text).into_owned());
+            let decoded = XmlIndex::decode_entities(text);
+            out.push(PyString::new(py, &decoded).unbind());
         }
     }
     for child in index.children(tag_idx) {
-        collect_text(index, child, out);
+        collect_text_py(py, index, child, out);
     }
 }
 
@@ -793,17 +845,22 @@ fn collect_text(index: &XmlIndex<'_>, tag_idx: usize, out: &mut Vec<String>) {
 ///
 /// Accepts bytes or str. Returns a Document that can be queried
 /// with XPath or traversed element-by-element.
+///
+/// For bytes input, the buffer is used directly (zero-copy).
+/// For str input, the string is encoded to UTF-8 bytes.
 #[pyfunction]
 fn parse(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Document> {
-    let bytes: Vec<u8> = if let Ok(b) = data.cast_exact::<PyBytes>() {
-        b.as_bytes().to_vec()
+    let owner = if data.is_instance_of::<PyBytes>() {
+        // Zero-copy: PyBackedBytes borrows from the Python bytes object
+        let backed: PyBackedBytes = data.extract()?;
+        DocumentOwner::ZeroCopy(backed)
     } else if let Ok(s) = data.extract::<String>() {
-        s.into_bytes()
+        DocumentOwner::Owned(s.into_bytes())
     } else {
         return Err(PyTypeError::new_err("parse() requires bytes or str"));
     };
 
-    let inner = DocumentInner::try_new(bytes, |owner| {
+    let inner = DocumentInner::try_new(owner, |owner| {
         let mut index =
             simdxml::parse(owner).map_err(|e| PyValueError::new_err(e.to_string()))?;
         index.ensure_indices();
@@ -831,7 +888,7 @@ fn parse(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Document> {
 
 /// Compile an XPath expression for repeated use.
 ///
-/// Like re.compile() -- parse the expression once, evaluate many times
+/// Like `re.compile()` -- parse the expression once, evaluate many times
 /// across different documents.
 #[pyfunction]
 fn compile(expr: &str) -> PyResult<CompiledXPath> {

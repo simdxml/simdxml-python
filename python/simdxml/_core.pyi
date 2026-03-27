@@ -166,8 +166,8 @@ class CompiledXPath:
 def parse(data: bytes | str) -> Document:
     """Parse XML into a Document.
 
-    Accepts ``bytes`` or ``str``. Returns a Document that can be queried
-    with XPath or traversed element-by-element.
+    Accepts ``bytes`` or ``str``. For bytes input, the buffer is used
+    directly (zero-copy). For str input, the string is encoded to UTF-8.
     """
     ...
 
