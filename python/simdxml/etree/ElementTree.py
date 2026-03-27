@@ -167,6 +167,6 @@ def _findall(
     """Find all matching subelements."""
     xpath = _path_to_xpath(path)
     try:
-        return element.xpath(xpath)
+        return list(element.xpath(xpath))
     except ValueError:
         return []

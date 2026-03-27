@@ -34,6 +34,8 @@ struct IndexWithMeta<'a> {
     parents: Vec<u32>,
     /// name_id[i] = index into interned names for tag i. usize::MAX = none.
     name_ids: Vec<usize>,
+    /// child_pos[i] = position of tag i within its parent's children list. u32::MAX = N/A.
+    child_positions: Vec<u32>,
     /// Unique tag name strings (used to build Python interned strings at parse time).
     unique_names: Vec<String>,
 }
@@ -103,24 +105,6 @@ impl Document {
         }
     }
 
-    fn make_elements(
-        py: Python<'_>,
-        doc: &Py<Document>,
-        doc_ref: &Document,
-        tag_indices: impl Iterator<Item = usize>,
-    ) -> Vec<Element> {
-        let meta = doc_ref.meta();
-        tag_indices
-            .map(|idx| {
-                let cached_tag = doc_ref.interned_tag_fast(py, meta, idx);
-                Element {
-                    doc: doc.clone_ref(py),
-                    tag_idx: idx,
-                    cached_tag,
-                }
-            })
-            .collect()
-    }
 }
 
 #[pymethods]
@@ -378,11 +362,8 @@ impl Element {
     /// Iterate over direct child elements.
     fn __iter__(&self, py: Python<'_>) -> ElementIterator {
         let doc = self.doc.borrow(py);
-        ElementIterator {
-            doc: self.doc.clone_ref(py),
-            children: doc.index().children(self.tag_idx),
-            pos: 0,
-        }
+        let children = doc.index().children(self.tag_idx);
+        ElementIterator::new(py, &self.doc, children)
     }
 
     /// Iterate descendant elements, optionally filtered by tag name.
@@ -404,11 +385,7 @@ impl Element {
                 }
             }
         }
-        ElementIterator {
-            doc: self.doc.clone_ref(py),
-            children: descendants,
-            pos: 0,
-        }
+        ElementIterator::new(py, &self.doc, descendants)
     }
 
     /// All direct child tag names as a list.
@@ -466,23 +443,25 @@ impl Element {
 
     /// Evaluate an XPath 1.0 expression with this element as context.
     ///
-    /// Returns a list of matching Element objects.
-    fn xpath(&self, py: Python<'_>, expr: &str) -> PyResult<Vec<Element>> {
+    /// Returns an ElementList of matching elements (lazy — elements created on access).
+    fn xpath(&self, py: Python<'_>, expr: &str) -> PyResult<ElementList> {
         let doc = self.doc.borrow(py);
         let index = doc.index();
         let nodes = index
             .xpath_from(expr, self.tag_idx)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-        Ok(Document::make_elements(
-            py,
-            &self.doc,
-            &doc,
-            nodes.into_iter().filter_map(|n| match n {
+        let indices: Vec<usize> = nodes
+            .into_iter()
+            .filter_map(|n| match n {
                 XPathNode::Element(idx) => Some(idx),
                 _ => None,
-            }),
-        ))
+            })
+            .collect();
+        Ok(ElementList {
+            doc: self.doc.clone_ref(py),
+            indices,
+        })
     }
 
     /// Evaluate an XPath expression and return text content of matches.
@@ -542,8 +521,8 @@ impl Element {
         if parent == u32::MAX {
             return None;
         }
+        let pos = meta.child_positions[self.tag_idx] as usize;
         let siblings = meta.index.children(parent as usize);
-        let pos = siblings.iter().position(|&s| s == self.tag_idx)?;
         siblings
             .get(pos + 1)
             .map(|&idx| Document::make_element_borrowed(py, &self.doc, &doc, idx))
@@ -557,9 +536,9 @@ impl Element {
         if parent == u32::MAX {
             return None;
         }
-        let siblings = meta.index.children(parent as usize);
-        let pos = siblings.iter().position(|&s| s == self.tag_idx)?;
+        let pos = meta.child_positions[self.tag_idx] as usize;
         if pos > 0 {
+            let siblings = meta.index.children(parent as usize);
             Some(Document::make_element_borrowed(
                 py,
                 &self.doc,
@@ -649,14 +628,35 @@ impl Element {
 }
 
 // ---------------------------------------------------------------------------
-// Element iterator
+// ElementIterator — pre-caches interned tags to avoid per-next borrow
 // ---------------------------------------------------------------------------
 
 #[pyclass]
 struct ElementIterator {
     doc: Py<Document>,
-    children: Vec<usize>,
+    /// (tag_idx, cached interned tag) pairs, pre-built at iterator creation.
+    items: Vec<(usize, Py<PyString>)>,
     pos: usize,
+}
+
+impl ElementIterator {
+    /// Build an iterator with all tags pre-cached (one Document borrow total).
+    fn new(py: Python<'_>, doc: &Py<Document>, indices: Vec<usize>) -> Self {
+        let doc_ref = doc.borrow(py);
+        let meta = doc_ref.meta();
+        let items: Vec<(usize, Py<PyString>)> = indices
+            .into_iter()
+            .map(|idx| {
+                let tag = doc_ref.interned_tag_fast(py, meta, idx);
+                (idx, tag)
+            })
+            .collect();
+        ElementIterator {
+            doc: doc.clone_ref(py),
+            items,
+            pos: 0,
+        }
+    }
 }
 
 #[pymethods]
@@ -666,13 +666,93 @@ impl ElementIterator {
     }
 
     fn __next__(&mut self, py: Python<'_>) -> Option<Element> {
-        if self.pos < self.children.len() {
-            let idx = self.children[self.pos];
+        if self.pos < self.items.len() {
+            let (idx, ref cached_tag) = self.items[self.pos];
             self.pos += 1;
-            Some(Document::make_element(py, &self.doc, idx))
+            Some(Element {
+                doc: self.doc.clone_ref(py),
+                tag_idx: idx,
+                cached_tag: cached_tag.clone_ref(py),
+            })
         } else {
             None
         }
+    }
+
+    fn __len__(&self) -> usize {
+        self.items.len() - self.pos
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ElementList — lazy sequence returned by xpath/eval (avoids N Element allocs)
+// ---------------------------------------------------------------------------
+
+/// A lazy list of elements. Holds one Document reference and a Vec of tag
+/// indices. Element objects are created on demand when accessed.
+#[pyclass(sequence)]
+struct ElementList {
+    doc: Py<Document>,
+    indices: Vec<usize>,
+}
+
+#[pymethods]
+impl ElementList {
+    fn __len__(&self) -> usize {
+        self.indices.len()
+    }
+
+    fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Element> {
+        let len = self.indices.len() as isize;
+        let i = if index < 0 { len + index } else { index };
+        if i < 0 || i >= len {
+            return Err(pyo3::exceptions::PyIndexError::new_err(
+                "list index out of range",
+            ));
+        }
+        Ok(Document::make_element(py, &self.doc, self.indices[i as usize]))
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> ElementIterator {
+        ElementIterator::new(py, &self.doc, self.indices.clone())
+    }
+
+    fn __bool__(&self) -> bool {
+        !self.indices.is_empty()
+    }
+
+    /// Support == comparison with lists and other ElementLists.
+    fn __eq__(&self, _py: Python<'_>, other: &Bound<'_, pyo3::PyAny>) -> bool {
+        // Compare with empty list
+        if let Ok(list) = other.cast::<pyo3::types::PyList>() {
+            if list.len() != self.indices.len() {
+                return false;
+            }
+            // Element-by-element comparison
+            for (i, item) in list.iter().enumerate() {
+                if let Ok(elem) = item.cast::<Element>() {
+                    let elem_ref = elem.borrow();
+                    if elem_ref.tag_idx != self.indices[i]
+                        || !elem_ref.doc.is(&self.doc)
+                    {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            return true;
+        }
+        // Compare with another ElementList
+        if let Ok(other_list) = other.cast::<ElementList>() {
+            let other_ref = other_list.borrow();
+            return self.doc.is(&other_ref.doc) && self.indices == other_ref.indices;
+        }
+        false
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ElementList(len={})", self.indices.len())
     }
 }
 
@@ -704,8 +784,8 @@ impl CompiledXPath {
             .collect())
     }
 
-    /// Evaluate and return matching Element objects.
-    fn eval(slf: &Bound<'_, Self>, doc: &Bound<'_, Document>) -> PyResult<Vec<Element>> {
+    /// Evaluate and return matching elements as an ElementList (lazy).
+    fn eval(slf: &Bound<'_, Self>, doc: &Bound<'_, Document>) -> PyResult<ElementList> {
         let this = slf.borrow();
         let doc_ref = doc.borrow();
         let doc_py: Py<Document> = doc.clone().unbind();
@@ -715,16 +795,17 @@ impl CompiledXPath {
             .eval(index)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-        let py = slf.py();
-        Ok(Document::make_elements(
-            py,
-            &doc_py,
-            &doc_ref,
-            nodes.into_iter().filter_map(|n| match n {
+        let indices: Vec<usize> = nodes
+            .into_iter()
+            .filter_map(|n| match n {
                 XPathNode::Element(idx) => Some(idx),
                 _ => None,
-            }),
-        ))
+            })
+            .collect();
+        Ok(ElementList {
+            doc: doc_py,
+            indices,
+        })
     }
 
     /// Check whether any nodes match.
@@ -777,17 +858,19 @@ fn get_first_attribute_str<'a>(index: &'a XmlIndex<'_>, tag_idx: usize) -> Optio
         .and_then(|name| index.get_attribute(tag_idx, name))
 }
 
-/// Build parent map, name-id map, and unique name list from the public API.
-fn build_meta(index: &XmlIndex<'_>) -> (Vec<u32>, Vec<usize>, Vec<String>) {
+/// Build parent map, child positions, name-id map, and unique name list.
+fn build_meta(index: &XmlIndex<'_>) -> (Vec<u32>, Vec<u32>, Vec<usize>, Vec<String>) {
     let n = index.tag_count();
 
-    // Parent map
+    // Parent map + child position (position within parent's children list).
     let mut parents = vec![u32::MAX; n];
+    let mut child_positions = vec![u32::MAX; n];
     for i in 0..n {
         if index.tag_type(i) == simdxml::index::TagType::Open {
-            for child in index.children(i) {
-                if child < n {
-                    parents[child] = i as u32;
+            for (pos, child) in index.children(i).iter().enumerate() {
+                if *child < n {
+                    parents[*child] = i as u32;
+                    child_positions[*child] = pos as u32;
                 }
             }
         }
@@ -813,7 +896,7 @@ fn build_meta(index: &XmlIndex<'_>) -> (Vec<u32>, Vec<usize>, Vec<String>) {
         }
     }
 
-    (parents, name_ids, unique_names)
+    (parents, child_positions, name_ids, unique_names)
 }
 
 /// Build interned Python strings from the unique name list.
@@ -865,11 +948,12 @@ fn parse(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Document> {
             simdxml::parse(owner).map_err(|e| PyValueError::new_err(e.to_string()))?;
         index.ensure_indices();
         index.build_name_index();
-        let (parents, name_ids, unique_names) = build_meta(&index);
+        let (parents, child_positions, name_ids, unique_names) = build_meta(&index);
         Ok::<_, PyErr>(IndexWithMeta {
             index,
             parents,
             name_ids,
+            child_positions,
             unique_names,
         })
     })?;
@@ -905,6 +989,7 @@ fn compile(expr: &str) -> PyResult<CompiledXPath> {
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Document>()?;
     m.add_class::<Element>()?;
+    m.add_class::<ElementList>()?;
     m.add_class::<CompiledXPath>()?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;

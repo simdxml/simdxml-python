@@ -34,6 +34,7 @@ from simdxml._core import (
     CompiledXPath,
     Document,
     Element,
+    ElementList,
     compile,
     parse,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "CompiledXPath",
     "Document",
     "Element",
+    "ElementList",
     "compile",
     "parse",
 ]

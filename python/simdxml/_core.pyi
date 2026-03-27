@@ -94,10 +94,10 @@ class Element:
     def text_content(self) -> str:
         """All descendant text concatenated into a single string."""
         ...
-    def xpath(self, expr: str) -> list[Element]:
+    def xpath(self, expr: str) -> ElementList:
         """Evaluate an XPath 1.0 expression with this element as context.
 
-        Returns a list of matching Element objects.
+        Returns an ElementList of matching elements (lazy — created on access).
         """
         ...
     def xpath_text(self, expr: str) -> list[str]:
@@ -143,6 +143,18 @@ class Element:
     def __eq__(self, other: object) -> bool: ...
     def __hash__(self) -> int: ...
 
+class ElementList:
+    """A lazy sequence of elements from an XPath query.
+
+    Elements are created on demand when accessed by index or iteration.
+    Holds a single Document reference regardless of result size.
+    """
+
+    def __len__(self) -> int: ...
+    def __getitem__(self, index: int) -> Element: ...
+    def __iter__(self) -> Iterator[Element]: ...
+    def __bool__(self) -> bool: ...
+
 class CompiledXPath:
     """A compiled XPath expression for repeated use.
 
@@ -153,8 +165,8 @@ class CompiledXPath:
     def eval_text(self, doc: Document) -> list[str]:
         """Evaluate and return text content of matching nodes."""
         ...
-    def eval(self, doc: Document) -> list[Element]:
-        """Evaluate and return matching Element objects."""
+    def eval(self, doc: Document) -> ElementList:
+        """Evaluate and return matching elements as an ElementList (lazy)."""
         ...
     def eval_exists(self, doc: Document) -> bool:
         """Check whether any nodes match the expression."""
